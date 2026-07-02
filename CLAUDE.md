@@ -237,3 +237,79 @@ peer connects, a swarm has peers, a BEP10 message arrives). Therefore:
   SodiumXT model).
 - **No em-dashes** in committed prose or docs (house style). Use hyphens, commas, colons, parentheses.
 - **Match the surrounding style:** comment the *why*, densely, as the siblings do.
+
+## As-built record (the operational truth, updated as we build)
+
+This section is the running as-built log the top of this file promises. It states what exists, how
+each piece is verified, and the open items, so no one has to reconstruct it from the diff.
+
+### What exists now (Phase 0 foundation + Phase 1 identity)
+
+```
+src/
+  riptide.livecodescript            foundation: the constitution made executable
+  riptide-identity.livecodescript   doc 02: seed, derivation, card, prekeys, key-transparency log
+  riptide-store.livecodescript      plan 4: encrypted-at-rest store + the ratchet-persist discipline
+  riptide-rendezvous.livecodescript doc 04: rid/pid/mid/coverId, the announce/getPeers dance, hello
+  riptide-session.livecodescript    doc 05: X3DH handshake, secretstream tunnel, rekey, cover-seed
+examples/
+  riptide-tests.livecodescript      on-engine self-test: asserts the frozen KATs through sx*, + negatives
+  riptide-demo.livecodescript       the Phase 0 vertical-slice driver (phantom swarm)
+tests/vectors/
+  vectors.c                         the 12.x derivation KATs (pre-existing; passes on libsodium 1.0.18)
+  rt_bencode.{c,h}                  reference canonical-bencode encoder (the oracle, NOT shipped)
+  wire_vectors.c                    byte-exact KATs: AD binding, BEP44 sign buffer (vs 12.6), id card
+  run.py                            builds + runs both C programs; the runnable conformance gate
+.github/workflows/ci.yml            the static gate + conformance vectors on every push
+```
+
+### How each piece is verified (be precise about this; do not overclaim)
+
+- **RUN-verified here (real, executable):** `tests/vectors/run.py` -> both C programs green against
+  libsodium 1.0.18. This pins the deterministic wire format: all 12.x derivations, the AD binding
+  bencode, the BEP44 signing buffer (cross-checked to the 12.6 signature by BUILDING the buffer and
+  signing it, not by freezing a string), and the identity-card canonical bencode. The oracle already
+  caught two hand-encoding errors (a dropped dict-close `e`, a length prefix written in hex not
+  decimal), which is exactly why it exists.
+- **Statically verified only (`tools/check-livecodescript.py` passes):** every `.livecodescript`.
+  There is no headless OpenXTalk here, so this is the ceiling for the script layer. Say "verified
+  statically; needs an on-engine pass," never "works."
+- **The bridge between the two:** `examples/riptide-tests.livecodescript` asserts the SAME frozen
+  answers as the C oracle, but through the `rt*`/`sx*` handlers. Running it on-engine is what promotes
+  the foundation from "static" to "on-engine verified," and it is the reconciliation vehicle for the
+  assumed `sx*` shapes (a mismatch fails a KAT and names the call to fix).
+
+### Architecture decisions taken (and why), for the next builder
+
+- **Implemented in `.livecodescript`, not `.lcb` (yet).** The plan names `riptide.lcb` as the public
+  library. Two constraints pushed the first cut to script: (a) the sibling `sx*`/`bt*` LCB module
+  names and exact signatures are not visible from this repo, so calling them from LCB is a guess; (b)
+  byte-wrangling (bencode) is idiomatic and higher-confidence in livecodescript (`numToByte`,
+  `binaryEncode`, byte chunks) than in unverifiable LCB byte ops. The `riptide.lcb` public-API/ABI
+  wrapper is a deferred refactor to do once the sibling modules can be linked on-engine. This is
+  noted, not hidden.
+- **All `sx*` calls are funnelled and documented** (the "-- sx bridge --" note in the foundation, the
+  `rtKp*` wrappers in identity, the `rtDh*` helpers in session), so an on-engine signature mismatch is
+  a one-place fix, not a scatter hunt. The assumed shapes come from doc 11's handler table and the
+  12.x vectors.
+- **Constants are script-local in OXT**, so channel modules call the foundation's *functions* for all
+  encoding/derivation and mirror only the handful of salts/types they name directly (each with a
+  pointer back to the authoritative registry in `riptide.livecodescript`).
+
+### Open items to resolve on-engine / upstream (the honest punch-list)
+
+- **Upstream TorrentXT blockers (Phase 0 cannot round-trip without these):** arbitrary-id DHT
+  announce/get_peers (11.2.1), BEP10 `rp1` custom extension messages (11.2.3, the single largest
+  item), peer/connection events (11.2.5), phantom-swarm mode (11.2.6). The `rt*` code that composes
+  them is written and static-clean; the `bt*`/`PW.*` wrappers are the reconciliation points.
+- **crypto_kx rx/tx pairing (flag for the maintainer to pin in doc 05/12).** The X3DH DH values and
+  the source-2 pairwise secret depend on which crypto_kx session-key half each side takes. libsodium
+  guarantees `client_rx == server_tx`, so this implementation takes that provably-equal pairing
+  (initiator/client takes `rx`, responder/server takes `tx`); a literal reading of the 05 5.3.2
+  snippet ("put tRx into DH1" on both sides) would diverge. There is no KAT for these (12.7 validates
+  them by "both sides agree"), so the on-engine two-instance handshake is the gate. Worth a one-line
+  clarification in doc 05 and a pinned handshake vector in doc 12.
+- **Assumed `sx*` script shapes** (keypair-as-array, secretstream handle/tag arrays, kx rx/tx array):
+  confirm against the SodiumXT script API and adjust the bridge wrappers if they differ.
+- **The `.lcb` public-API/ABI wrapper and packaging** (`package-extension.py` is ported and ready) are
+  deferred until the siblings can be linked on-engine.
