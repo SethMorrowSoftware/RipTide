@@ -1,0 +1,39 @@
+# Riptide CI: the two automated gates the plan (IMPLEMENTATION-PLAN.md sec 6/7)
+# makes non-negotiable for a script-and-protocol layer. There is no headless
+# OpenXTalk, so we cannot compile the .lcb/.livecodescript here; what we CAN pin
+# is (1) the static gate over every script file and (2) the deterministic wire
+# format, run against libsodium. Both must stay green.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  static-gate:
+    # The only automated safety net for the LCB/livecodescript layer: smart
+    # quotes, handler/unsafe balance, constants-before-use, the prefixed-token-
+    # shadow trap, and the LCB import checks (tools/check-livecodescript.py).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: static check the script layer
+        run: python3 tools/check-livecodescript.py
+
+  conformance-vectors:
+    # The wire-format known-answer tests: the 12.x derivations (vectors.c) and
+    # the byte-exact serializations - AD binding, BEP44 signing buffer, identity
+    # card (wire_vectors.c via the reference bencode encoder). A libsodium bump
+    # or a coding error that moved any of them fails here instead of silently
+    # breaking interop.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libsodium
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+      - name: run conformance vectors
+        run: python3 tests/vectors/run.py
