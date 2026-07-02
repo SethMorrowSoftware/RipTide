@@ -208,3 +208,35 @@ private command rtT_negativeTamper
    rtT_assertTrue "tampered BEP44 value fails signature verify", \
          (not sxSignVerifyDetached(tSig, tBad, tId["ik_ed_pub"]))
 end rtT_negativeTamper
+
+-- =====================================================================
+-- TRANSPORT RECONCILIATION (run ONLY with the TorrentXT extension loaded)
+-- =====================================================================
+-- Kept OUT of rtRunSelfTest so the core crypto/wire harness runs standalone
+-- (sx* only). This one calls a bt* handler, so it needs TorrentXT ABI v10 loaded
+-- alongside SodiumXT. It pins the one cross-library reconciliation the audit
+-- flagged: the BEP44 value convention. Riptide passes a record value to the DHT
+-- put as raw bytes; TorrentXT's btDhtBep44SignBuf must bencode it into the SAME
+-- canonical buffer Riptide signs (rtBep44SignBuffer). For the 12.6 inputs the
+-- Riptide builder takes the ALREADY-bencoded value "2:hi", so the engine builder
+-- fed the RAW value "hi" must produce identical bytes iff it wraps a Data as a
+-- bencoded byte string. A FAIL here is not a crash - it tells the integrator the
+-- engine's value convention differs, so records must be pre-bencoded before the
+-- put (the fix is one place: rtPublishPrekeyBundle's value argument).
+--
+-- Run on-engine: put rtRunTransportReconcile() into field "report".
+function rtRunTransportReconcile
+   local tRiptide, tEngine
+   rtT_reset
+   put rtBep44SignBuffer("rp-prekeys", 1, "2:hi") into tRiptide
+   put rtDhtBep44SignBuf("rp-prekeys", "1", "hi") into tEngine
+   rtT_assertBytes "BEP44 buffer: engine btDhtBep44SignBuf == Riptide rtBep44SignBuffer", \
+         tEngine, tRiptide
+   put "-------------------" & return after sReport
+   if sFail is 0 then
+      put ("PASS (" & sPass & " checks) - engine value convention matches") after sReport
+   else
+      put ("FAIL (" & sFail & " of " & (sPass + sFail) & ") - see the note above") after sReport
+   end if
+   return sReport
+end rtRunTransportReconcile

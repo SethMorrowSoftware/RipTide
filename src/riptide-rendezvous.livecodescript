@@ -10,14 +10,16 @@ script "riptide-rendezvous"
 --
 -- Composes the foundation (rid/pid/mid/coverId derivations, the AD binding, the
 -- rendezvous-hello encoding) and SodiumXT. The DHT/peer-wire operations are
--- TorrentXT (bt*); their exact script handler names are confirmed on-engine and
--- funnelled through the rtDht*/rtPw* wrappers near the bottom, matching the
+-- TorrentXT (bt*), funnelled through the rtDht*/rtPw* wrappers in
+-- riptide-transport.livecodescript (the one bt* bridge), matching the
 -- DHT.* / PW.* notation of 03 3.11 and 11-capabilities-required.md.
 --
--- STATUS: verified statically only; needs an on-engine pass. The derivations
--- (rid 12.2, pid 12.3) are pinned; the rendezvous flow needs TorrentXT's
--- arbitrary-id DHT announce (11.2.1) and BEP10 rp1 (11.2.3), the upstream
--- blockers, before it runs end to end.
+-- STATUS: verified statically; needs an on-engine pass. The derivations (rid
+-- 12.2, pid 12.3) are pinned. The transport capabilities it needs LANDED in
+-- TorrentXT ABI v10 - arbitrary-id DHT announce/get_peers (11.2.1) and BEP10 rp1
+-- (11.2.3) - so the flow is now reconciled to the real engine and driven by the
+-- async poll-drain model (discovery is start-a-query + match-the-event, never a
+-- blocking return); the on-engine two-instance run is the remaining gate.
 -- =====================================================================
 
 constant kTypeRendezvousHello is 4   -- 0x04 (3.6, added by doc 04)
@@ -96,27 +98,46 @@ command rtRendezvousAnnounce pPairwiseSecret, pEpoch
    return empty
 end rtRendezvousAnnounce
 
--- Query the three adjacent rendezvous ids and return the union of candidate
--- IP:port peers (newline-separated). Each candidate is unproven (anyone can
--- announce at any id), so the caller gates each with a rendezvous-hello (4.3.1)
--- before spending handshake effort.
-function rtRendezvousDiscover pPairwiseSecret, pEpoch
-   local tOff, tEpochN, tRid, tPeers, tAll
-   put empty into tAll
+-- Listener setup: join the phantom swarm at the CURRENT-epoch rendezvous id so
+-- the engine will accept incoming rp1 peer-wire connections there with no torrent
+-- metadata behind it (11.2.6), then announce across the window so an initiator
+-- can find us (4.4). The initiator, by contrast, only needs to discover + connect
+-- out, so it does not join a phantom swarm. Returns the phantom torrent handle
+-- (0 on failure) so the caller can tell the join apart from the announces.
+command rtRendezvousListen pPairwiseSecret, pEpoch, pSavePath
+   local tRid, tHandle
+   put rtRendezvousId(pPairwiseSecret, pEpoch) into tRid
+   put rtDhtJoinPhantom(tRid, pSavePath) into tHandle
+   rtRendezvousAnnounce pPairwiseSecret, pEpoch
+   return tHandle
+end rtRendezvousListen
+
+-- Start discovery: kick an ASYNCHRONOUS get_peers on the three adjacent
+-- rendezvous ids and return the return-separated list of their 40-hex targets.
+-- The peers do not come back here (the DHT is async, see riptide-transport);
+-- they land later as dhtGetPeers events. The caller holds the returned target
+-- list, drains rtBtPoll on the poll beat, and passes both to rtRendezvousCollect
+-- to harvest candidates. This never blocks the interpreter thread (CLAUDE.md).
+function rtRendezvousDiscoverStart pPairwiseSecret, pEpoch
+   local tOff, tRid, tTargets
+   put empty into tTargets
    repeat for each item tOff in "-1,0,1"
-      put (pEpoch + tOff) into tEpochN
-      put rtRendezvousId(pPairwiseSecret, tEpochN) into tRid
-      put rtDhtGetPeers(tRid) into tPeers
-      repeat for each line tPeer in tPeers
-         if tPeer is not empty and tPeer is not among the lines of tAll then
-            put tPeer & return after tAll
-         end if
-      end repeat
+      put rtRendezvousId(pPairwiseSecret, (pEpoch + tOff)) into tRid
+      rtDhtGetPeersStart tRid          -- fire the query; status ignored (async)
+      put rtIdHex(tRid) & return after tTargets
    end repeat
-   -- delete a trailing return
-   if the last char of tAll is return then delete the last char of tAll
-   return tAll
-end rtRendezvousDiscover
+   if the last char of tTargets is return then delete the last char of tTargets
+   return tTargets
+end rtRendezvousDiscoverStart
+
+-- Harvest candidate IP:port peers from a drained poll list for the three targets
+-- rtRendezvousDiscoverStart returned. Each candidate is UNPROVEN (anyone can
+-- announce at any id), so the caller gates each with a rendezvous-hello (4.3.1)
+-- before spending handshake effort. Thin pass-through to the transport matcher so
+-- the "for each element" event walk lives in exactly one place.
+function rtRendezvousCollect pEvents, pTargetsHex
+   return rtDhtMatchPeers(pEvents, pTargetsHex)
+end rtRendezvousCollect
 
 -- =====================================================================
 -- THE RENDEZVOUS-HELLO CONTROL FRAME (4.3.1)
@@ -266,34 +287,30 @@ command rtPresenceAnnounce pPairwiseSecret, pEpoch
    return empty
 end rtPresenceAnnounce
 
--- Watch a contact's presence: a non-empty result means "online now, at this
--- IP:port," which doubles as the rendezvous for the session it triggers (4.6).
-function rtPresenceWatch pPairwiseSecret, pEpoch
-   local tOff, tPid, tPeers, tAll
-   put empty into tAll
+-- Watch a contact's presence, async like discovery: start get_peers on the three
+-- adjacent presence ids and return their 40-hex targets. A later non-empty
+-- rtPresenceCollect over a drained poll list means "online now, at this IP:port,"
+-- which doubles as the rendezvous for the session it triggers (4.6).
+function rtPresenceWatchStart pPairwiseSecret, pEpoch
+   local tOff, tPid, tTargets
+   put empty into tTargets
    repeat for each item tOff in "-1,0,1"
       put rtPresenceId(pPairwiseSecret, (pEpoch + tOff)) into tPid
-      put rtDhtGetPeers(tPid) into tPeers
-      repeat for each line tPeer in tPeers
-         if tPeer is not empty and tPeer is not among the lines of tAll then
-            put tPeer & return after tAll
-         end if
-      end repeat
+      rtDhtGetPeersStart tPid
+      put rtIdHex(tPid) & return after tTargets
    end repeat
-   if the last char of tAll is return then delete the last char of tAll
-   return tAll
-end rtPresenceWatch
+   if the last char of tTargets is return then delete the last char of tTargets
+   return tTargets
+end rtPresenceWatchStart
 
--- =====================================================================
--- bt / peer-wire bridge (assumed TorrentXT script API; reconcile on-engine)
--- =====================================================================
--- The DHT.* / PW.* operations of 03 3.11 and doc 11. Names assumed; each is the
--- single reconciliation point for its operation. These are the upstream-blocked
--- capabilities (11.2.1 arbitrary-id announce, 11.2.3 rp1): Phase 0 cannot run
--- end to end until TorrentXT exposes them.
-private command rtDhtAnnounce pId20
-   btDhtAnnounce pId20            -- BEP5 announce_peer on an arbitrary 20-byte id (11.2.1)
-end rtDhtAnnounce
-private function rtDhtGetPeers pId20
-   return btDhtGetPeers(pId20)    -- BEP5 get_peers -> newline list of ip:port (11.2.1)
-end rtDhtGetPeers
+-- Harvest the watched contact's IP:port from a drained poll list (same matcher as
+-- discovery; presence and rendezvous both ride dhtGetPeers events).
+function rtPresenceCollect pEvents, pTargetsHex
+   return rtDhtMatchPeers(pEvents, pTargetsHex)
+end rtPresenceCollect
+
+-- The bt* / peer-wire bridge that used to be sketched here now lives in ONE
+-- place, riptide-transport.livecodescript (rtDht*, rtPw*, the session handle, and
+-- the poll-event matchers), reconciled against TorrentXT ABI v10. Rendezvous
+-- calls those wrappers (rtDhtAnnounce, rtDhtGetPeersStart, rtDhtJoinPhantom,
+-- rtIdHex, rtDhtMatchPeers) rather than any bt* handler directly.

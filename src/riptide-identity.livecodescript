@@ -164,37 +164,56 @@ function rtBuildPrekeyBundle pIdentity, pSpk, pOpkPubList, pExpiryUnix
 end rtBuildPrekeyBundle
 
 -- Publish the bundle as a BEP44 mutable record under IK with salt rp-prekeys.
--- Riptide signs the BEP44 signing buffer with the identity key (never letting
--- TorrentXT sign with its own key, 11.2.2), then hands the signature to the DHT
--- put. Reports via the result: empty on success, else an error.
+-- The external-signing dance (11.2.2 option a): ask TorrentXT for the EXACT
+-- canonical buffer it will verify against, sign THAT with the identity key in
+-- SodiumXT, and hand only the detached signature to the DHT put. The identity
+-- secret never enters TorrentXT; TorrentXT verifies the signature against IK_pub
+-- before storing (rtDhtPutSigned returns -3 on a bad signature). Signing the
+-- engine's own buffer (not our rtBep44SignBuffer output) keeps the signed bytes
+-- byte-identical to the verified bytes; the on-engine self-test asserts the two
+-- builders agree for the 12.6 inputs. pSeq is a decimal string. Reports via the
+-- result: the put status code (0 ok), or an error string.
 command rtPublishPrekeyBundle pIdentity, pBundleValue, pSeq
-   local tSignBuf, tSig
-   put rtBep44SignBuffer(kSaltPrekeys, pSeq, pBundleValue) into tSignBuf
+   local tSignBuf, tSig, tPubHex, tSigHex
+   put rtDhtBep44SignBuf(kSaltPrekeys, pSeq, pBundleValue) into tSignBuf
+   if tSignBuf is empty then
+      return "bep44-signbuf-failed"
+   end if
    put sxSignDetached(tSignBuf, pIdentity["ik_ed_sec"]) into tSig
-   -- TorrentXT mutable put with an externally-supplied signature (11.2.2). The
-   -- exact bt* handler name is confirmed on-engine; assumed btDhtPutMutable.
-   btDhtPutMutable pIdentity["ik_ed_pub"], kSaltPrekeys, pSeq, pBundleValue, tSig
+   put sxBin2Hex(pIdentity["ik_ed_pub"]) into tPubHex       -- 64-hex ed25519 pub
+   put sxBin2Hex(tSig) into tSigHex                          -- 128-hex signature
+   rtDhtPutSigned tPubHex, kSaltPrekeys, pSeq, pBundleValue, tSigHex
    return the result
 end rtPublishPrekeyBundle
 
--- Fetch a contact's prekey bundle from the DHT, verify the BEP44 signature
--- against their identity key, verify spk_sig, and parse. pIkEdPub is the
--- contact's identity signing key (already verified out of band / via the log,
--- 02 2.5). Returns an array ok/true|false plus the fields on success. Fails
+-- Start an asynchronous fetch of a contact's prekey bundle (the DHT get is not a
+-- blocking return; the item lands later as a dhtMutableItem event). pIkEdPub is
+-- the contact's identity signing key (raw bytes). Reports the get status via the
+-- result. The caller drains rtBtPoll and passes each batch to
+-- rtFetchPrekeyBundleFromItem until it reports ok.
+command rtFetchPrekeyBundleStart pIkEdPub
+   rtDhtGetMutableStart sxBin2Hex(pIkEdPub), kSaltPrekeys
+   return the result
+end rtFetchPrekeyBundleStart
+
+-- Complete a fetch from a matched dhtMutableItem event: verify the BEP44
+-- signature against the contact's identity key, verify spk_sig, and parse. Fails
 -- closed on any signature failure (3.10) - a MITM serving a forged bundle is
--- rejected here, not trial-trusted.
-function rtFetchPrekeyBundle pIkEdPub
-   local tGet, tR, tSignBuf, tD, tV
+-- rejected here, not trial-trusted. pItem is rtDhtMatchMutable's array
+-- (value/seq/signature, signature 128-hex). Returns ok/true|false plus fields.
+function rtFetchPrekeyBundleFromItem pIkEdPub, pItem
+   local tR, tSignBuf, tSig, tD, tV
    put false into tR["ok"]
-   -- assumed btDhtGetMutable -> array with seq/value/sig
-   put btDhtGetMutable(pIkEdPub, kSaltPrekeys) into tGet
-   if tGet["ok"] is not true then return tR
-   put rtBep44SignBuffer(kSaltPrekeys, tGet["seq"], tGet["value"]) into tSignBuf
-   if not sxSignVerifyDetached(tGet["sig"], tSignBuf, pIkEdPub) then
+   if pItem["ok"] is not true then return tR
+   -- rebuild the exact bytes TorrentXT signed over, via the engine's own builder,
+   -- so verify uses the identical value convention as the put (transport note 3).
+   put rtDhtBep44SignBuf(kSaltPrekeys, pItem["seq"], pItem["value"]) into tSignBuf
+   put sxHex2Bin(pItem["signature"]) into tSig     -- event carries 128-hex sig
+   if not sxSignVerifyDetached(tSig, tSignBuf, pIkEdPub) then
       put "bep44-sig-failed" into tR["error"]   -- surfaced, not swallowed (3.10)
       return tR
    end if
-   put rtBdecode(tGet["value"]) into tD
+   put rtBdecode(pItem["value"]) into tD
    if not tD["ok"] then return tR
    if tD["type"] is not "dict" then return tR
    put tD["value"] into tV
@@ -213,7 +232,7 @@ function rtFetchPrekeyBundle pIkEdPub
       put tV["opks"] into tR["opks"]     -- nested list array (numbered)
    end if
    return tR
-end rtFetchPrekeyBundle
+end rtFetchPrekeyBundleFromItem
 
 -- =====================================================================
 -- KEY TRANSPARENCY: THE IDENTITY LOG (02 2.6)
