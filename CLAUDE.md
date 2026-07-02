@@ -252,9 +252,10 @@ src/
   riptide-store.livecodescript      plan 4: encrypted-at-rest store + the ratchet-persist discipline
   riptide-rendezvous.livecodescript doc 04: rid/pid/mid/coverId, the announce/getPeers dance, hello
   riptide-session.livecodescript    doc 05: X3DH handshake, secretstream tunnel, rekey, cover-seed
+  riptide-transport.livecodescript  the single bt* bridge: DHT/BEP44/rp1/phantom over TorrentXT v10
 examples/
   riptide-tests.livecodescript      on-engine self-test: asserts the frozen KATs through sx*, + negatives
-  riptide-demo.livecodescript       the Phase 0 vertical-slice driver (phantom swarm)
+  riptide-demo.livecodescript       the Phase 0 vertical-slice driver (phantom swarm, async poll loop)
 tests/vectors/
   vectors.c                         the 12.x derivation KATs (pre-existing; passes on libsodium 1.0.18)
   rt_bencode.{c,h}                  reference canonical-bencode encoder (the oracle, NOT shipped)
@@ -292,16 +293,35 @@ tests/vectors/
   `rtKp*` wrappers in identity, the `rtDh*` helpers in session), so an on-engine signature mismatch is
   a one-place fix, not a scatter hunt. The assumed shapes come from doc 11's handler table and the
   12.x vectors.
+- **All `bt*` (TorrentXT) calls are funnelled through ONE module** (`riptide-transport.livecodescript`),
+  for the same reason. Reconciled against the shipped TorrentXT ABI v10: `btDhtGetPeers`/`btDhtAnnounce`
+  on a bare id, `btDhtBep44SignBuf`/`btDhtPutSigned`/`btDhtGetMutable` (external signing hook),
+  `btRp1Enable`/`btRp1SetToken`/`btRp1Send`/`btRp1Poll`, `btAddInfohash` (phantom swarm), and
+  `btStartSession`/`btPoll`/`btStopSession`. Two shapes drove real changes: ids cross as **40-hex
+  strings** (raw 20-byte ids are `sxBin2Hex`'d only at this boundary), and the DHT is **asynchronous**
+  (a get is "start a query" now + "match the `dhtGetPeers`/`dhtMutableItem` poll event" later, never a
+  blocking return), so `rtRendezvousDiscover` split into `...Start` + `rtRendezvousCollect` and the
+  prekey fetch into `...Start` + `...FromItem`. BEP44 signing stays in SodiumXT: we sign the exact
+  buffer `btDhtBep44SignBuf` returns and hand only the detached signature to `btDhtPutSigned`, so the
+  identity key never enters TorrentXT (11.2.2 option a).
 - **Constants are script-local in OXT**, so channel modules call the foundation's *functions* for all
   encoding/derivation and mirror only the handful of salts/types they name directly (each with a
   pointer back to the authoritative registry in `riptide.livecodescript`).
 
 ### Open items to resolve on-engine / upstream (the honest punch-list)
 
-- **Upstream TorrentXT blockers (Phase 0 cannot round-trip without these):** arbitrary-id DHT
-  announce/get_peers (11.2.1), BEP10 `rp1` custom extension messages (11.2.3, the single largest
-  item), peer/connection events (11.2.5), phantom-swarm mode (11.2.6). The `rt*` code that composes
-  them is written and static-clean; the `bt*`/`PW.*` wrappers are the reconciliation points.
+- **Upstream TorrentXT blockers: RESOLVED in TorrentXT ABI v10.** All four Phase 0 capabilities
+  landed - arbitrary-id DHT announce/get_peers (11.2.1), BEP10 `rp1` custom extension messages
+  (11.2.3), peer/connection events (11.2.5), phantom-swarm mode (11.2.6) - plus the BEP44 external
+  signing hook (11.2.2). The bridge (`riptide-transport.livecodescript`) is reconciled to the shipped
+  handler signatures and the async poll-drain model. What remains is the ON-ENGINE run: load SodiumXT
+  + TorrentXT + Riptide on the OXT engine and drive two instances through `riptide-demo` (the crypto is
+  pinned by the vectors; the transport path is static-clean and needs the live confirmation). Two
+  reconciliation points are flagged inline for that pass: (a) the poll-event representation (a "List of
+  Arrays", iterated with `for each element` in the transport matchers), and (b) the BEP44 value
+  convention (`rtRunTransportReconcile` in the self-test asserts `btDhtBep44SignBuf` bencodes a raw
+  `Data` value into the same buffer Riptide signs; a mismatch means records must be pre-bencoded before
+  the put, a one-place fix in `rtPublishPrekeyBundle`).
 - **crypto_kx rx/tx pairing (flag for the maintainer to pin in doc 05/12).** The X3DH DH values and
   the source-2 pairwise secret depend on which crypto_kx session-key half each side takes. libsodium
   guarantees `client_rx == server_tx`, so this implementation takes that provably-equal pairing
