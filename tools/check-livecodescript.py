@@ -58,6 +58,21 @@ RESERVED = {
     "text", "the", "then", "this", "throw", "to", "token", "true", "trueword",
     "type", "unsafe", "until", "use", "value", "variable", "where", "while",
     "with", "without", "word",
+    # The shadow-trap check only inspects t/p/s/k-prefixed names, so a collision
+    # is only possible with a reserved word / built-in property / function that
+    # itself STARTS with t, p, s, or k. The set above was missing several of
+    # those (notably `top`, an object property: `tOp` lowercases to `top` and
+    # the engine parses it as the property, not a variable). Only ATOMIC short
+    # tokens belong here: a compound property like `textFont` is legitimately
+    # written in that CamelCase when you set the property, so listing it would
+    # false-positive on correct code, while nobody names a variable `textFont`.
+    # These atomic tokens are the realistic traps (a careless prefix+suffix that
+    # spells one); extend as more are found on-engine.
+    "tan", "time", "tool", "top",
+    "param", "params", "pi", "player", "point", "pow",
+    "script", "scroll", "second", "seconds", "seek", "sin", "size", "space",
+    "sqrt", "stack", "start", "stop", "style", "sum",
+    "keys",
 }
 
 LCB_HANDLER_OPENERS = ("handler",)               # .lcb: handler / public handler
@@ -161,7 +176,9 @@ def classify_opener(tokens, is_script):
         return "repeat"
     if first == "try":
         return "try"                      # try ... catch ... finally ... end try
-    if first in ("else", "catch", "finally"):
+    if first == "switch":
+        return "switch"                   # switch ... case ... default ... end switch
+    if first in ("else", "catch", "finally", "case", "default"):
         return None                       # continuation, not a new block
     if first == "if" and tokens[-1] == "then":
         return "if"                       # block if; single-line if has code after `then`
@@ -176,7 +193,7 @@ def check_balance(path, stripped_lines, is_script, problems):
             continue
         if tokens[0] == "end":
             what = tokens[1] if len(tokens) > 1 else ""
-            if what in ("if", "repeat", "unsafe", "try", "library", "module", "widget"):
+            if what in ("if", "repeat", "unsafe", "try", "switch", "library", "module", "widget"):
                 if not stack or stack[-1][0] != what:
                     top = stack[-1][0] if stack else "nothing"
                     problems.append(Problem(
@@ -293,12 +310,106 @@ def check_put_prepositions(path, stripped_lines, problems):
                 "(`put X into Y` to replace, or `put X after Y` to append)"))
 
 
+def check_zero_arg_statement_calls(path, text):
+    """A zero-argument call written `foo()` in STATEMENT position.
+
+    LiveCodeScript has no "call a function and discard the result" statement.
+    A line that starts with an identifier is parsed as a COMMAND, and whatever
+    follows is its argument list - so `dcCleanup()` asks the engine to pass the
+    expression `()` to the command `dcCleanup`, and `()` is not an expression.
+    It is a compile error, and because a .livecodescript compiles as one unit it
+    takes the WHOLE FILE with it, usually reported at some unrelated line.
+
+    Three things make this worth a gate rather than a lesson in a header:
+
+      - The one-argument spelling `dcFreePeer(sPeerA)` is FINE, because `(sPeerA)`
+        IS an expression. So the broken form looks exactly like the working one
+        that sits next to it, and reading the file does not distinguish them.
+      - In EXPRESSION position `dcCleanup() is 0` is correct and required. Same
+        eight characters, opposite verdicts, decided by what is to the left.
+      - This is LiveCodeScript only. LiveCode BUILDER allows `sPrepare()` as a
+        statement, and both sodium.lcb and coinxt.lcb use it hundreds of times
+        on paths that have run green on a real engine. Flagging .lcb here would
+        be ~90 false positives and would get the whole rule switched off.
+
+    Found the hard way: the suite self-test failed on an engine at
+    `dcCleanup()`, folded in from datachannelxt's harness. Three of the four
+    sites had a working bare call within a few lines of them.
+    """
+    if path.endswith(".lcb"):
+        return []
+    out, continued = [], False
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        line = raw.split("--", 1)[0] if '"' not in raw.split("--", 1)[0] else raw
+        stripped = line.strip()
+        # A continuation line is part of the PREVIOUS statement, so an
+        # identifier + () there is an ordinary call inside an expression.
+        was_continued, continued = continued, stripped.endswith("\\")
+        if was_continued or not stripped:
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)$", stripped)
+        if m:
+            out.append((lineno, m.group(1)))
+    return out
+
+
+def check_engine_hostile_constructs(path, text):
+    """Two constructs that COMPILE, RUN, and silently do the wrong thing on OXT.
+
+    Both were found the same way: by an operator at an engine, after every gate
+    in the repo had gone green. Both had exactly ONE occurrence in the whole
+    six-member suite, which is why neither had ever been in front of an engine -
+    and that rarity is the point. A construct nobody else uses is a construct
+    nobody else has proved.
+
+    1. `repeat with i = A to B step N`. The increment was not honoured: i walked
+       one at a time. In cxHexDecode that made the last pass read one character
+       past the pairs, get empty, and throw "not a hex digit" over VALID input -
+       the library accusing the caller's data of being corrupt, in the exact
+       words it reserves for real corruption. Use `repeat while` with an
+       explicit `add N to i`, which is what every other loop in the family does.
+
+    2. `throw` from INSIDE a `catch` block. The error does not reach the caller;
+       the handler falls through and returns whatever its result variable holds,
+       which is usually empty. Nine itemDelimiter guards did this, and one of
+       them was cxMnemonicValidate, whose Inner reaches `return false` only via
+       its own catch - so a mistyped seed phrase was reported VALID. Capture the
+       error in a local, close the try, then throw after `end try`.
+       NOTE `return` inside a catch is FINE and engine-proven (onionxt's
+       oxSodiumHasSha3 does it on a path this same run exercised); only `throw`
+       is affected, so this checks only `throw`.
+
+    LiveCodeScript only. LiveCode Builder is a different language and its .lcb
+    files are not scanned here.
+    """
+    if path.endswith(".lcb"):
+        return []
+    out, in_catch, depth = [], False, 0
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        line = raw.split("--", 1)[0].strip() if '"' not in raw.split("--", 1)[0] else raw.strip()
+        low = line.lower()
+        if re.match(r"^repeat\s+with\s+\w+\s*=.*\bstep\b", low):
+            out.append((lineno, "step"))
+        if re.match(r"^try\b", low):
+            depth += 1
+        elif re.match(r"^catch\b", low) and depth > 0:
+            in_catch = True
+        elif re.match(r"^end\s+try\b", low):
+            depth -= 1
+            if depth <= 0:
+                in_catch, depth = False, max(depth, 0)
+        elif in_catch and re.match(r"^throw\b", low):
+            out.append((lineno, "throw-in-catch"))
+    return out
+
+
 def check_file(path, problems):
     with open(path, "r", encoding="utf-8") as handle:
         text = handle.read()
     raw_lines = text.splitlines()
     code = strip_block_comments(text)
     stripped_lines = [strip_line(l) for l in code.splitlines()]
+    raw_text = "\n".join(raw_lines)
     is_script = path.endswith(".livecodescript")
 
     check_banned_chars(path, raw_lines, problems)
@@ -306,6 +417,10 @@ def check_file(path, problems):
     check_constants_before_use(path, stripped_lines, problems)
     check_shadow_trap(path, stripped_lines, problems)
     check_put_prepositions(path, stripped_lines, problems)
+    for lineno, kind in check_engine_hostile_constructs(path, raw_text):
+        problems.append(Problem(path, lineno, "%s" % ("a `repeat with ... step N` loop does not honour its increment on OXT; use `repeat while` with an explicit `add N to` (see cxHexDecode)" if kind == "step" else "a `throw` inside a `catch` block does not reach the caller on OXT; capture the error, close the try, and throw after `end try` (see the guards in coinxt.livecodescript)")))
+    for lineno, name in check_zero_arg_statement_calls(path, raw_text):
+        problems.append(Problem(path, lineno, "a zero-argument call written %s() in statement position does not compile in LiveCodeScript (the engine parses `()` as the command's argument, and `()` is not an expression). Write it bare: %s" % (name, name)))
     if not is_script:
         check_lcb_imports(path, stripped_lines, problems)
 

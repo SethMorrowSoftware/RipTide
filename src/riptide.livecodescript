@@ -1,675 +1,973 @@
-script "riptide"
--- =====================================================================
--- riptide.livecodescript - the Riptide foundation library.
+script "RiptideSocial"
+-- riptide.livecodescript - Riptide Social, phase 1: the identity foundation
+-- and the pure-compute feed layer, as a pure-LiveCodeScript library over the
+-- installed suite extensions (docs/RIPTIDE-SOCIAL-SPEC.md sections 3-4).
 --
--- This is the constitution (03-conventions.md) made executable: the pieces
--- every channel composes. It owns:
---   * the version + registry constants (KDF contexts, sxHash domain tags,
---     message types, BEP44 salts, sizes) - the single source of truth the
---     channel modules read, so no channel can invent an alternative encoding;
---   * canonical bencode (3.2): the byte-exact serialization BEP44 signing and
---     the AD binding depend on;
---   * the associated-data binding (3.5.1) and the BEP44 signing buffer (3.7);
---   * the envelope build/open helpers (3.5) and the padding buckets (3.5.2);
---   * thin, documented wrappers over the registry-pinned SodiumXT derivations
---     (identity seeds, rendezvous/presence/inbox ids, safety number, session
---     keys), so the label registry is applied in exactly one place.
+-- STATUS (honesty convention): every handler in this file is verified
+-- statically and against tools/riptide_reference.py's golden vectors via the
+-- offline harness in tests/riptide-selftest.livecodescript; NONE of it has
+-- run on a real OXT engine yet. Needs an OXT pass. Nothing here touches the
+-- network: transport wiring (DHT puts, rp1, onion streams) is phase 2+ and
+-- deliberately absent, so this layer stays testable offline.
 --
--- HONESTY / STATUS. There is no headless OpenXTalk here, so this file is
--- "verified statically" (tools/check-livecodescript.py) only; it needs an
--- on-engine compile + interop pass. The deterministic outputs it must produce
--- (canonical bencode, AD binding, BEP44 signing buffer, all the 12.x
--- derivations) are pinned and RUN-verified by the C oracle in tests/vectors/;
--- the on-engine self-test (examples/riptide-tests.livecodescript) asserts the
--- SAME frozen answers through the sx* handlers, so the two paths meet.
+-- WHAT THIS LAYER OWNS
+--   - the master seed and the RIPTKEY1 sealed key file (Argon2id + secretbox,
+--     the BTXPREF1 convention with riptide's own magic)
+--   - the KDF subkey tree: one 32-byte master -> identity / DM / LAN / anon
+--     subkeys via sxKdfDerive, context "riptide\0" (8 bytes exactly)
+--   - identity -> handle (ed25519 public key, 64 hex) -> .onion address
+--   - the rendezvous derivations: inboxId and roomId
+--   - the RSH1 feed-head and RSP1 post-record framings, build + parse +
+--     signature verification, caps enforced on BOTH sides
 --
--- ASSUMED SodiumXT SCRIPT API. Riptide adds no cryptography; every protected
--- byte is a SodiumXT call. The exact script-callable shapes of the sx* handlers
--- live in the SodiumXT repo (not visible from here), so ALL sx* calls are
--- funnelled through the "-- sx bridge --" wrappers near the bottom of this file
--- and documented with their assumed signature. If a signature differs
--- on-engine, fix it THERE, in one place, not scattered through the channels.
--- The assumed shapes (from 11-capabilities-required.md and the 12.x vectors):
---   sxKdfDerive(pMasterKey, pSubkeyIdDecimalString, pContext8, pOutLen) -> Data
---   sxHash(pData, pOutLen) -> Data
---   sxHashKeyed(pData, pKey, pOutLen) -> Data
---   sxSignDetached(pData, pSecretKey) -> Data (64-byte signature)
---   sxSignVerifyDetached(pSig, pData, pPublicKey) -> true/false
---   sxSignKeypairFromSeed(pSeed) -> array with keys "public","secret"
---   sxBoxKeypairFromSeed(pSeed) / sxKeyExchangeKeypairFromSeed(pSeed) -> same
---   sxSeal(pData, pRecipientPub) / sxSealOpen(pC, pPub, pSec) -> Data
---   sxBox(pData, pRecipientPub, pSenderSec) / sxBoxOpen(pC, pSenderPub, pRecipientSec)
---   sxAeadEncrypt(pData, pAd, pKey) / sxAeadDecrypt(pC, pAd, pKey) -> Data
---   sxSecretBox(pData, pKey) / sxSecretBoxOpen(pC, pKey) -> Data
---   sxPad(pData, pBlock) / sxUnpad(pData, pBlock) -> Data
---   sxMemEqual(pA, pB) -> true/false (constant time)
---   sxRandomBytes(pN) -> Data
--- House style: ASCII only, no em-dashes; comment the why, densely.
--- =====================================================================
+-- EXTENSION DEPENDENCIES (probed, never assumed; rsProbeCapabilities):
+--   SodiumXT  HARD  the trust root; without it this library refuses to work.
+--                   At ABI 7 it also serves sxSha3_256, the preferred SHA3
+--                   provider for the OFFLINE .onion self-computation (shipped
+--                   2026-08-11, closing onionxt docs/08 gap #2).
+--   coinxt    soft  cxSha3_256 is the FALLBACK SHA3 provider (the same
+--                   vendored FIPS-202 code; what this app composed before
+--                   sodiumxt shipped it). With neither ABI 7 nor coinxt,
+--                   rsOnionFromPublicKey returns empty with a clear error;
+--                   the VERIFY direction below still works.
+--   onionxt   soft  oxPublicKeyFromAddress verifies a CLAIMED onion against
+--                   a handle offline (structural decode, no daemon needed)
+--   torrentxt / enetxt / datachannelxt: probed and reported for the app's
+--                   capability matrix; nothing in phase 1 calls them.
+--
+-- ERROR CONVENTION: functions return empty (or false) on failure and record
+-- the reason; rsLastError() returns it. sx* failures throw, so every foreign
+-- call in here sits inside a try. No handler in this file ever throws.
+--
+-- WIRE FORMATS (pinned byte-for-byte by tests/riptide_golden_test.py; the
+-- magic IS the version - any framing change bumps it, never a silent fix):
+--   RIPTKEY1: "RIPTKEY1" "E" salt(16) sxSecretBox(seed32, argon2idKey)
+--   RSH1 head: magic(4) seq(u64 BE) nameLen(u8) name latestPostTarget(40 hex)
+--     prekeyTarget(40 hex) onionLen(u8: 0 or 62) onionAddr
+--     profileMetaTarget(40 hex)
+--   RSP1 post: magic(4) timestamp(u64 BE) prevPostTarget(40 hex) kind(1)
+--     kind "D": textLen(u16 BE) text(UTF-8)
+--     kind "C": chunkCount(u8, 1..16) then chunkCount * 40-hex targets
+--     mediaCount(u8, 0..8) then mediaCount * 40-hex info-hashes
+--     authorSig(64): ed25519 detached over every byte before it
+--   u64 travels as hi:u32 lo:u32 via binaryEncode("NN"), the BTXO discipline.
+--   DHT targets travel as 40 ASCII hex; the all-zeros target means "none".
 
--- ---- versioning (3.1) --------------------------------------------------
--- The wire protocol version stamped in every structured record's `v` field. A
--- receiver rejects an unknown major version rather than guessing (3.1, 3.10).
-constant kRtProtocolVersion is 1
--- Riptide holds no C shim of its own, so its "ABI" is really this protocol
--- version plus the SodiumXT/TorrentXT extension versions it was built against.
--- rtCheckDependencies (below) is the checkABI analogue: it fails loudly on a
--- sibling-version skew instead of corrupting a session on first use.
-constant kRtSpecVersion is "0.1"
-constant kSxAbiExpected is 5      -- 02-identity.md 2.2: seeded keypairs need SodiumXT ABI 5
+constant kRsVersion = "0.1.0"
+constant kRsKeyMagic = "RIPTKEY1"
+constant kRsHeadMagic = "RSH1"
+constant kRsPostMagic = "RSP1"
+constant kRsHeadSalt = "riptide-head"
+constant kRsKdfContextText = "riptide"
+constant kRsInboxSuffix = "riptide-inbox"
+constant kRsZeroTarget = "0000000000000000000000000000000000000000"
+constant kRsSubkeyIdentity = "1"
+constant kRsSubkeyDm = "2"
+constant kRsSubkeyLan = "3"
+constant kRsSubkeyAnonBase = 100
+constant kRsMaxDisplayName = 64
+constant kRsMaxMedia = 8
+constant kRsMaxChunks = 16
+constant kRsMaxRecord = 1000
+constant kRsOnionAddrLen = 62
+constant kRsArgonOps = "2"
+constant kRsBase32Alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+constant kRsChecksumPrefix = ".onion checksum"
 
--- ---- KDF label registry (3.4): 8-byte ASCII contexts -------------------
--- Each MUST be exactly 8 bytes; rtSelfCheck asserts it at load. A channel that
--- needs a new context adds it here AND in 03-conventions.md, never inline.
-constant kCtxIdent is "rp-ident"   -- identity derivation (02): id 0 sign,1 box,2 kx
-constant kCtxRndzv is "rp-rndzv"   -- rendezvous DHT id / confirm key (04)
-constant kCtxPrsnc is "rp-prsnc"   -- presence DHT id (04)
-constant kCtxSess0 is "rp-sess0"   -- session root key (05)
-constant kCtxTxrx0 is "rp-txrx0"   -- directional session keys (05): id 0 tx,1 rx
-constant kCtxRatch is "rp-ratch"   -- mailbox chain-key ratchet (06)
-constant kCtxSendr is "rp-sendr"   -- group per-member sender key (08)
-constant kCtxFeedk is "rp-feedk"   -- feed read-key rotation (07)
-constant kCtxCvsig is "rp-cvsig"   -- (optional) cover-seed recognition signing (05)
+local sRsLastError
+local sRsProbed
+local sRsCaps
 
--- ---- sxHash domain-separation tags (3.4): ASCII, any length ------------
--- Used where a derivation is keyed by a public key or non-secret material, so
--- crypto_kdf's 32-byte-secret-master requirement does not apply and sxHash with
--- an explicit tag is the right tool.
-constant kTagInboxId is "rp-mbxid"       -- mailbox inbox id (06)
-constant kTagFcMeet is "rp-fc-meet/v1"   -- first-contact meeting id (04)
-constant kTagRndzvPw is "rp-rndzv-pw/v1" -- passphrase-derived rendezvous secret (04)
-constant kTagCover is "rp-cover"         -- cover-swarm blend mask (04)
-constant kTagCvrsd is "rp-cvrsd"         -- cover-seed recognition token (05)
-constant kTagRoom0 is "rp-room0"         -- local room label (08)
+--------------------------------------------------------------------------
+-- diagnostics and capability probes
+--------------------------------------------------------------------------
 
--- ---- message-type registry (3.6): `t` field and rp1 subtype byte -------
-constant kTypeIdentityCard is 1     -- 0x01
-constant kTypePrekeyBundle is 2     -- 0x02
-constant kTypeIdlogEntry is 3       -- 0x03
-constant kTypeRendezvousHello is 4  -- 0x04
-constant kTypeMailboxMessage is 16  -- 0x10
-constant kTypeMailboxAck is 17      -- 0x11
-constant kTypePrekeyConsume is 18   -- 0x12
-constant kTypeHandshakeInit is 32   -- 0x20
-constant kTypeHandshakeResp is 33   -- 0x21
-constant kTypeSessionData is 34     -- 0x22
-constant kTypeSessionRekey is 35    -- 0x23
-constant kTypeFeedEntry is 48       -- 0x30
-constant kTypeWallEntry is 49       -- 0x31
-constant kTypeFeedKeyUpdate is 50   -- 0x32
-constant kTypeGroupMessage is 64    -- 0x40
-constant kTypeMemberAdd is 65       -- 0x41
-constant kTypeMemberRemove is 66    -- 0x42
-constant kTypeObjectManifest is 80  -- 0x50
-constant kTypeChunkKey is 81        -- 0x51
+function rsVersion
+   return "Riptide" && kRsVersion && "(phase 1: identity + feed framing)"
+end rsVersion
 
--- ---- BEP44 reserved salts (3.7) ----------------------------------------
-constant kSaltPrekeys is "rp-prekeys"
-constant kSaltIdlog is "rp-idlog"
-constant kSaltFeed is "rp-feed"
-constant kSaltWall is "rp-wall"
+function rsLastError
+   return sRsLastError
+end rsLastError
 
--- ---- sizes and buckets -------------------------------------------------
-constant kDhtIdLen is 20          -- mainline DHT keyspace (BEP5), 160 bits
-constant kKeyLen is 32            -- ed25519/X25519/kx public key, KDF master, most keys
-constant kPadBlockRecord is 256   -- 3.5.2 DHT-record padding bucket
-constant kPadBlockWire is 1024    -- 3.5.2 peer-wire session padding bucket
-constant kEpochSeconds is 3600    -- 3.9 default epoch length (1 hour)
+private command rsSetError pMessage
+   put pMessage into sRsLastError
+end rsSetError
 
--- =====================================================================
--- LOW-LEVEL BYTE + INTEGER HELPERS
--- =====================================================================
+-- Probe each extension once, each in its own try, into a cached array.
+-- SodiumXT gets a REAL round-trip (the family's chCanEncrypt pattern);
+-- the rest are cheap presence probes. Fail-closed: a missing extension
+-- disables exactly its feature and never another one.
+function rsProbeCapabilities
+   local tCaps, tKey, tBox, tOpened, tIgnore
+   if sRsProbed is true then return sRsCaps
+   put false into tCaps["canCrypto"]
+   put false into tCaps["hasTorrent"]
+   put false into tCaps["hasOnion"]
+   put false into tCaps["hasDataChannel"]
+   put false into tCaps["hasEnet"]
+   put false into tCaps["hasCoin"]
+   try
+      put sxRandomBytes(32) into tKey
+      put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
+      put sxSecretBoxOpen(tBox, tKey) into tOpened
+      put (textDecode(tOpened, "ASCII") is "probe") into tCaps["canCrypto"]
+   catch tIgnore
+      put false into tCaps["canCrypto"]
+   end try
+   try
+      put btLastError() into tIgnore
+      put true into tCaps["hasTorrent"]
+   catch tIgnore
+      put false into tCaps["hasTorrent"]
+   end try
+   try
+      put (oxVersion() is not empty) into tCaps["hasOnion"]
+   catch tIgnore
+      put false into tCaps["hasOnion"]
+   end try
+   try
+      put (dcLibraryVersion() is not empty) into tCaps["hasDataChannel"]
+   catch tIgnore
+      put false into tCaps["hasDataChannel"]
+   end try
+   try
+      put (enLibraryVersion() is not empty) into tCaps["hasEnet"]
+   catch tIgnore
+      put false into tCaps["hasEnet"]
+   end try
+   try
+      put (cxSha3_256Len() is 32) into tCaps["hasCoin"]
+   catch tIgnore
+      put false into tCaps["hasCoin"]
+   end try
+   -- Derived capability: SHA3-256 from EITHER provider (sodiumxt ABI 7's
+   -- sxSha3_256, or coinxt's cxSha3_256) - what the offline onion
+   -- self-computation actually needs. A real call, not a version sniff.
+   put (the number of bytes in rsSha3(textEncode("probe", "ASCII")) is 32) \
+         into tCaps["hasSha3"]
+   put tCaps into sRsCaps
+   put true into sRsProbed
+   return sRsCaps
+end rsProbeCapabilities
 
--- Canonical decimal form of an integer for bencode: no leading zeros, "0" for
--- zero, a single leading '-' for negatives, never "-0". LiveCode renders an
--- integer variable exactly this way, so coercing to a number and formatting is
--- the canonical form. (bencode integer, 3.2.)
-private function rtCanonInt pN
-   -- trunc guards against a fractional slipping in; Riptide integers (epoch,
-   -- seq, type, counter) are always whole. Values stay < 2^53 (epochs, seqs),
-   -- inside LiveCode's exact-integer range.
-   put trunc(pN) into pN
-   return pN & empty   -- string-ise; LiveCode gives the canonical decimal
-end rtCanonInt
+-- Constants are script-scoped in xTalk, so the two wire values an APP needs
+-- are exposed as functions.
+function rsHeadSalt
+   return kRsHeadSalt
+end rsHeadSalt
 
--- be64(n): n as 8 big-endian bytes (3.11). Built from two big-endian uint32
--- halves because binaryEncode has no single 64-bit unsigned format; the high
--- half is 0 for every value Riptide uses (counters/epochs well under 2^32 for
--- the foreseeable future, but the full 8-byte width is on the wire regardless).
-function rtBe64 pN
-   local tHigh, tLow
-   put trunc(pN) into pN
-   put trunc(pN / 4294967296) into tHigh   -- 2^32
-   put pN - (tHigh * 4294967296) into tLow
-   return binaryEncode("NN", tHigh, tLow)
-end rtBe64
+function rsZeroTarget
+   return kRsZeroTarget
+end rsZeroTarget
 
--- =====================================================================
--- CANONICAL BENCODE (3.2)
--- =====================================================================
--- Two serializations exist in Riptide (3.2); this is the structured one:
--- bencoded dicts with keys sorted lexicographically by RAW BYTE VALUE. Integers
--- are bencode integers; binary blobs are bencode byte strings (length-prefixed
--- raw bytes, so keys/ciphertext/signatures hold arbitrary bytes safely).
+--------------------------------------------------------------------------
+-- the master seed and the RIPTKEY1 sealed key file
+--------------------------------------------------------------------------
 
--- bencode integer: i<decimal>e
-function rtBencInt pN
-   return "i" & rtCanonInt(pN) & "e"
-end rtBencInt
+function rsGenerateMasterSeed
+   local tSeed, tErr
+   try
+      put sxRandomBytes(32) into tSeed
+   catch tErr
+      rsSetError "rsGenerateMasterSeed: SodiumXT is required:" && tErr
+      return empty
+   end try
+   return tSeed
+end rsGenerateMasterSeed
 
--- bencode byte string: <len>:<bytes>. Length is the BYTE count (not char), so
--- arbitrary binary is safe.
-function rtBencBytes pData
-   return (the number of bytes of pData) & ":" & pData
-end rtBencBytes
-
--- Raw byte-value comparison of two dict keys, mirroring the C oracle's
--- key_less: memcmp over the shorter length, shorter key first on a tie. Riptide
--- dict keys are short ASCII field names (3.2), but comparing by byte value keeps
--- this correct for any key and matches BEP44 ordering exactly.
-private function rtKeyLess pA, pB
-   local tLa, tLb, tM, tI, tCa, tCb
-   put the number of bytes of pA into tLa
-   put the number of bytes of pB into tLb
-   put min(tLa, tLb) into tM
-   repeat with tI = 1 to tM
-      put byteToNum(byte tI of pA) into tCa
-      put byteToNum(byte tI of pB) into tCb
-      if tCa < tCb then return true
-      if tCa > tCb then return false
-   end repeat
-   return tLa < tLb   -- equal prefix: the shorter key sorts first
-end rtKeyLess
-
--- Encode a dict whose VALUES ARE ALREADY BENCODED FRAGMENTS. This mirrors the C
--- oracle's bdict_add_raw path: callers build each field with rtBencInt /
--- rtBencBytes / a nested rtBencodeDict, store it under the ASCII field-name key,
--- then hand the array here. We sort the keys by raw byte value and emit d...e.
--- Doing the sort at emit time (never trusting insertion order) is what keeps the
--- output canonical and BEP44-signable.
-function rtBencodeDict pFields
-   local tKeys, tSorted, tK, tI, tJ, tOut
-   -- collect keys
-   put the keys of pFields into tKeys   -- newline-separated, arbitrary order
-   -- insertion sort by rtKeyLess (n is small: a handful of fields per record)
-   put empty into tSorted
-   repeat for each line tK in tKeys
-      if tSorted is empty then
-         put tK into tSorted
-         next repeat
-      end if
-      put false into tI
-      repeat with tJ = 1 to the number of lines of tSorted
-         if rtKeyLess(tK, line tJ of tSorted) then
-            put tK & return before line tJ of tSorted
-            put true into tI
-            exit repeat
-         end if
-      end repeat
-      if not tI then put return & tK after tSorted
-   end repeat
-   -- emit
-   put "d" into tOut
-   repeat for each line tK in tSorted
-      put rtBencBytes(tK) after tOut     -- the key as a bencode byte string
-      put pFields[tK] after tOut         -- the already-bencoded value fragment
-   end repeat
-   put "e" after tOut
+-- Seal the master seed under a passphrase: a fresh random 16-byte salt on
+-- every save, Argon2id (opslimit "2", interactive memlimit - the parameters
+-- every sealed file in the family uses; both ends must agree), then
+-- secretbox. Layout: "RIPTKEY1" "E" salt(16) box(nonce24 ct32 mac16).
+function rsSealMasterSeed pSeed, pPassphrase
+   local tSalt, tKey, tOut, tErr
+   if the number of bytes in pSeed is not 32 then
+      rsSetError "rsSealMasterSeed: the master seed must be 32 bytes"
+      return empty
+   end if
+   if pPassphrase is empty then
+      rsSetError "rsSealMasterSeed: an empty passphrase is refused"
+      return empty
+   end if
+   try
+      put sxRandomBytes(16) into tSalt
+      put sxPwHash(textEncode(pPassphrase, "UTF-8"), tSalt, 32, \
+            kRsArgonOps, sxPwMemInteractive()) into tKey
+      put textEncode(kRsKeyMagic & "E", "ASCII") & tSalt & \
+            sxSecretBox(pSeed, tKey) into tOut
+   catch tErr
+      rsSetError "rsSealMasterSeed:" && tErr
+      return empty
+   end try
    return tOut
-end rtBencodeDict
+end rsSealMasterSeed
 
--- Minimal bencode DECODER for parsing received records. Returns an array with:
---   tResult["ok"]   true/false
---   tResult["type"] "int" | "bytes" | "list" | "dict"
---   tResult["value"] the decoded value (a number, Data, or nested structure via
---                    numbered/string keys), and tResult["end"] the 1-based byte
---                    index just past what was consumed.
--- Fail-closed: a malformed encoding sets ok=false and is surfaced (3.10), never
--- guessed around. Kept deliberately simple; the records Riptide parses are small
--- and shallow.
-function rtBdecode pData, pStart
-   local tR
-   if pStart is empty then put 1 into pStart
-   put false into tR["ok"]
-   if pStart > the number of bytes of pData then return tR
-   local tC
-   put byte pStart of pData into tC
-   if tC is "i" then
-      return rtBdecodeInt(pData, pStart)
-   else if tC is "l" then
-      return rtBdecodeList(pData, pStart)
-   else if tC is "d" then
-      return rtBdecodeDict(pData, pStart)
-   else if tC is a number then
-      return rtBdecodeBytes(pData, pStart)
+-- Unlock: parse the layout strictly, re-derive the wrap key, open the box.
+-- A wrong passphrase fails the Poly1305 tag inside sxSecretBoxOpen - it
+-- throws, we catch, and the caller gets empty plus a clear reason. It can
+-- never silently mis-decrypt.
+function rsOpenMasterSeed pFileBytes, pPassphrase
+   local tSalt, tSealed, tKey, tSeed, tHeader, tErr
+   -- A RIPTKEY1 file is EXACTLY 97 bytes: 9 (magic "RIPTKEY1E") + 16 (salt) +
+   -- 72 (sxSecretBox of a 32-byte seed = nonce 24 + ct 32 + mac 16). Refuse a
+   -- wrong length up front rather than leaning on the Poly1305 tag to catch a
+   -- truncated file (it does catch it - this is just an honest, explicit gate).
+   if the number of bytes in pFileBytes is not 97 then
+      rsSetError "rsOpenMasterSeed: not a 97-byte RIPTKEY1 file"
+      return empty
    end if
-   return tR
-end rtBdecode
-
-private function rtBdecodeInt pData, pStart
-   local tR, tI, tE, tStr
-   put false into tR["ok"]
-   put pStart + 1 into tI     -- skip 'i'
-   put empty into tStr
-   repeat while tI <= the number of bytes of pData
-      if byte tI of pData is "e" then
-         put tI into tE
-         exit repeat
-      end if
-      put byte tI of pData after tStr
-      add 1 to tI
-   end repeat
-   if tE is empty then return tR
-   -- reject a non-canonical integer (leading zeros, "-0", empty) - fail closed
-   if tStr is empty then return tR
-   if tStr is not an integer then return tR
-   if (the length of tStr > 1) and (char 1 of tStr is "0") then return tR
-   if (char 1 of tStr is "-") and (char 2 of tStr is "0") then return tR
-   put true into tR["ok"]
-   put "int" into tR["type"]
-   put (tStr + 0) into tR["value"]
-   put tE + 1 into tR["end"]
-   return tR
-end rtBdecodeInt
-
-private function rtBdecodeBytes pData, pStart
-   local tR, tI, tColon, tLenStr, tLen, tVal
-   put false into tR["ok"]
-   put pStart into tI
-   put empty into tLenStr
-   repeat while tI <= the number of bytes of pData
-      if byte tI of pData is ":" then
-         put tI into tColon
-         exit repeat
-      end if
-      if byte tI of pData is not a number then return tR
-      put byte tI of pData after tLenStr
-      add 1 to tI
-   end repeat
-   if tColon is empty then return tR
-   if tLenStr is empty then return tR
-   if (the length of tLenStr > 1) and (char 1 of tLenStr is "0") then return tR
-   put (tLenStr + 0) into tLen
-   if (tColon + tLen) > the number of bytes of pData then return tR
-   if tLen is 0 then
-      put empty into tVal
-   else
-      put byte (tColon + 1) to (tColon + tLen) of pData into tVal
+   put textDecode(byte 1 to 9 of pFileBytes, "ASCII") into tHeader
+   if tHeader is not (kRsKeyMagic & "E") then
+      rsSetError "rsOpenMasterSeed: not a RIPTKEY1 sealed key file"
+      return empty
    end if
-   put true into tR["ok"]
-   put "bytes" into tR["type"]
-   put tVal into tR["value"]
-   put tColon + tLen + 1 into tR["end"]
-   return tR
-end rtBdecodeBytes
-
-private function rtBdecodeList pData, pStart
-   local tR, tI, tElem, tN
-   put false into tR["ok"]
-   put pStart + 1 into tI    -- skip 'l'
-   put 0 into tN
-   repeat while tI <= the number of bytes of pData
-      if byte tI of pData is "e" then
-         put true into tR["ok"]
-         put "list" into tR["type"]
-         put tN into tR["count"]
-         put tI + 1 into tR["end"]
-         return tR
-      end if
-      put rtBdecode(pData, tI) into tElem
-      if not tElem["ok"] then return tR
-      add 1 to tN
-      put tElem["value"] into tR["value"][tN]
-      put tElem["type"] into tR["itemType"][tN]
-      put tElem["end"] into tI
-   end repeat
-   return tR
-end rtBdecodeList
-
-private function rtBdecodeDict pData, pStart
-   local tR, tI, tKey, tVal
-   put false into tR["ok"]
-   put pStart + 1 into tI    -- skip 'd'
-   repeat while tI <= the number of bytes of pData
-      if byte tI of pData is "e" then
-         put true into tR["ok"]
-         put "dict" into tR["type"]
-         put tI + 1 into tR["end"]
-         return tR
-      end if
-      put rtBdecodeBytes(pData, tI) into tKey   -- a dict key is always a byte string
-      if not tKey["ok"] then return tR
-      put tKey["end"] into tI
-      put rtBdecode(pData, tI) into tVal
-      if not tVal["ok"] then return tR
-      -- store the value and its type under the ASCII key name
-      put tVal["value"] into tR["value"][tKey["value"]]
-      put tVal["type"] into tR["itemType"][tKey["value"]]
-      put tVal["end"] into tI
-   end repeat
-   return tR
-end rtBdecodeDict
-
--- =====================================================================
--- THE ASSOCIATED-DATA BINDING (3.5.1) AND BEP44 SIGNING BUFFER (3.7)
--- =====================================================================
-
--- ad = bencode({ e: epoch, q: seq, t: type }). Keys sort e < q < t by raw byte
--- value, so rtBencodeDict emits them in that order. Every AEAD envelope binds
--- its position and kind here so a captured ciphertext cannot be replayed or
--- reordered into another slot (a decrypt with a different e/q/t fails auth).
--- Pinned by the C oracle W.1/W.2.
-function rtAdBinding pEpoch, pSeq, pType
-   local tF
-   put rtBencInt(pEpoch) into tF["e"]
-   put rtBencInt(pSeq) into tF["q"]
-   put rtBencInt(pType) into tF["t"]
-   return rtBencodeDict(tF)
-end rtAdBinding
-
--- The BEP44 mutable signing buffer (3.7): the concatenation
---    [4:salt <bencoded salt>]  3:seq i<seq>e  1:v <bencoded value>
--- The salt segment is omitted when there is no salt (BEP44). CRITICAL: the value
--- is appended AS ITS BENCODED FORM. In real Riptide use the record value is
--- itself a canonical-bencode envelope dict (d...e), so pass those very bytes as
--- pBencodedValue and they are appended verbatim - NOT re-wrapped as a byte
--- string. (Wrapping would produce <len>:d...e and break every DHT verify.)
--- Pinned by the C oracle W.3 against conformance vector 12.6.
-function rtBep44SignBuffer pSalt, pSeq, pBencodedValue
-   local tOut
-   put empty into tOut
-   if pSalt is not empty then
-      put rtBencBytes("salt") after tOut     -- 4:salt
-      put rtBencBytes(pSalt) after tOut      -- <len>:<salt>
+   put byte 10 to 25 of pFileBytes into tSalt
+   put byte 26 to -1 of pFileBytes into tSealed
+   try
+      put sxPwHash(textEncode(pPassphrase, "UTF-8"), tSalt, 32, \
+            kRsArgonOps, sxPwMemInteractive()) into tKey
+      put sxSecretBoxOpen(tSealed, tKey) into tSeed
+   catch tErr
+      rsSetError "rsOpenMasterSeed: wrong passphrase or corrupted key file"
+      return empty
+   end try
+   if the number of bytes in tSeed is not 32 then
+      rsSetError "rsOpenMasterSeed: the sealed payload is not a 32-byte seed"
+      return empty
    end if
-   put rtBencBytes("seq") after tOut         -- 3:seq
-   put rtBencInt(pSeq) after tOut            -- i<seq>e
-   put rtBencBytes("v") after tOut           -- 1:v
-   put pBencodedValue after tOut             -- raw bencoded value (a dict d...e)
+   return tSeed
+end rsOpenMasterSeed
+
+--------------------------------------------------------------------------
+-- the KDF subkey tree (spec section 3.2)
+--------------------------------------------------------------------------
+
+-- The context is the 8-byte string "riptide" plus one NUL - built here
+-- because a constant cannot hold a NUL byte. sxKdfDerive requires exactly
+-- 8 bytes (crypto_kdf_CONTEXTBYTES) and throws on any other length.
+private function rsKdfContext
+   return textEncode(kRsKdfContextText, "ASCII") & numToByte(0)
+end rsKdfContext
+
+private function rsSubkey pMaster, pSubkeyId
+   local tOut, tErr
+   if the number of bytes in pMaster is not 32 then
+      rsSetError "rsSubkey: the master seed must be 32 bytes"
+      return empty
+   end if
+   try
+      put sxKdfDerive(pMaster, pSubkeyId, rsKdfContext(), 32) into tOut
+   catch tErr
+      rsSetError "rsSubkey:" && tErr
+      return empty
+   end try
    return tOut
-end rtBep44SignBuffer
+end rsSubkey
 
--- =====================================================================
--- PADDING (3.5.2) AND ENVELOPES (3.5)
--- =====================================================================
--- Padding hides plaintext length before encryption. rtPadRecord for DHT-record
--- channels (256-byte bucket, keeps records inside the ~1000-byte BEP44 budget),
--- rtPadWire for peer-wire sessions (1024). Recipients unpad after a successful
--- open. All padding is SodiumXT's sxPad/sxUnpad; Riptide only picks the bucket.
-function rtPadRecord pData
-   return sxPad(pData, kPadBlockRecord)
-end rtPadRecord
-function rtUnpadRecord pData
-   return sxUnpad(pData, kPadBlockRecord)
-end rtUnpadRecord
-function rtPadWire pData
-   return sxPad(pData, kPadBlockWire)
-end rtPadWire
-function rtUnpadWire pData
-   return sxUnpad(pData, kPadBlockWire)
-end rtUnpadWire
+function rsIdentitySeed pMaster
+   return rsSubkey(pMaster, kRsSubkeyIdentity)
+end rsIdentitySeed
 
--- Sealed envelope (3.5): anonymous sender. c = sxSeal(pad(m), recipientPub).
--- Used for a first mailbox message and the first-contact intro (04 4.5), where
--- the sender stays anonymous to onlookers and only the recipient can open it.
-function rtSealEnvelope pPlain, pRecipientPub
-   return sxSeal(rtPadRecord(pPlain), pRecipientPub)
-end rtSealEnvelope
-function rtOpenSealEnvelope pC, pRecipientPub, pRecipientSec
-   local tPadded
-   put sxSealOpen(pC, pRecipientPub, pRecipientSec) into tPadded
-   return rtUnpadRecord(tPadded)   -- sxSealOpen fails closed on tamper (3.10)
-end rtOpenSealEnvelope
+function rsDmSeed pMaster
+   return rsSubkey(pMaster, kRsSubkeyDm)
+end rsDmSeed
 
--- Boxed envelope (3.5): authenticated sender. c = sxBox(pad(m), recipientPub,
--- senderSec). The sender's public key is conveyed in a signed field or out of
--- band, never trusted from the envelope alone.
-function rtBoxEnvelope pPlain, pRecipientPub, pSenderSec
-   return sxBox(rtPadRecord(pPlain), pRecipientPub, pSenderSec)
-end rtBoxEnvelope
-function rtOpenBoxEnvelope pC, pSenderPub, pRecipientSec
-   return rtUnpadRecord(sxBoxOpen(pC, pSenderPub, pRecipientSec))
-end rtOpenBoxEnvelope
+function rsLanKey pMaster
+   return rsSubkey(pMaster, kRsSubkeyLan)
+end rsLanKey
 
--- AEAD envelope (3.5): symmetric with binding. c = sxAeadEncrypt(pad(m), ad,
--- key) where ad = rtAdBinding(epoch, seq, type). The caller supplies epoch/seq/
--- type so the ciphertext is bound to its slot; a decrypt with a different slot
--- fails auth (3.5.1). Padding uses the record bucket by default; pass wire=true
--- for a peer-wire-sized message.
-function rtAeadEnvelope pPlain, pEpoch, pSeq, pType, pKey, pWire
-   local tAd, tPadded
-   put rtAdBinding(pEpoch, pSeq, pType) into tAd
-   if pWire is true then
-      put rtPadWire(pPlain) into tPadded
-   else
-      put rtPadRecord(pPlain) into tPadded
-   end if
-   return sxAeadEncrypt(tPadded, tAd, pKey)
-end rtAeadEnvelope
-function rtOpenAeadEnvelope pC, pEpoch, pSeq, pType, pKey, pWire
-   local tAd, tPadded
-   put rtAdBinding(pEpoch, pSeq, pType) into tAd
-   put sxAeadDecrypt(pC, tAd, pKey) into tPadded   -- fails closed on tamper/wrong slot
-   if pWire is true then
-      return rtUnpadWire(tPadded)
-   end if
-   return rtUnpadRecord(tPadded)
-end rtOpenAeadEnvelope
-
--- =====================================================================
--- THE EPOCH CLOCK (3.9)
--- =====================================================================
--- epoch = floor(unixTimeSeconds / EPOCH_SECONDS). Wall-clock based, so peers may
--- differ by an epoch; callers check adjacent epochs (epoch-1, epoch+1) for drift
--- (3.9, 04 4.4). pSeconds overrides the default for a channel that pins another.
-function rtEpochNow pSeconds
-   local tS
-   if pSeconds is empty then put kEpochSeconds into pSeconds
-   put the seconds into tS    -- unix seconds (UTC)
-   return trunc(tS / pSeconds)
-end rtEpochNow
-
--- The three adjacent epochs to try, newline-separated: epoch-1, epoch, epoch+1.
-function rtEpochWindow pEpoch
-   return (pEpoch - 1) & return & pEpoch & return & (pEpoch + 1)
-end rtEpochWindow
-
--- =====================================================================
--- REGISTRY-PINNED DERIVATIONS
--- =====================================================================
--- Each applies exactly one KDF context or domain tag from the registry above,
--- so the label discipline lives in one place. All are deterministic and pinned
--- by the conformance vectors (12.x) / the C oracle.
-
--- Identity subkey seeds from the master seed S (02 2.2): id 0 -> ed25519 seed,
--- id 1 -> X25519 box seed, id 2 -> kx seed, each 32 bytes under rp-ident.
-function rtIdentitySeed pMasterSeed, pId
-   return sxKdfDerive(pMasterSeed, rtCanonInt(pId), kCtxIdent, kKeyLen)
-end rtIdentitySeed
-
--- Rendezvous DHT id (04 4.2): 20 bytes from the 32-byte pairwise secret PS and
--- the epoch under rp-rndzv. Pinned by vector 12.2.
-function rtRendezvousId pPairwiseSecret, pEpoch
-   return sxKdfDerive(pPairwiseSecret, rtCanonInt(pEpoch), kCtxRndzv, kDhtIdLen)
-end rtRendezvousId
-
--- Rendezvous confirmation key (04 4.3.1): 32 bytes from the SAME PS, epoch, and
--- rp-rndzv label - crypto_kdf gives independent output at a different length, so
--- the 20-byte id and this 32-byte key never collide, with no extra registry
--- label. Keys the AEAD proof in the rendezvous-hello.
-function rtRendezvousConfirmKey pPairwiseSecret, pEpoch
-   return sxKdfDerive(pPairwiseSecret, rtCanonInt(pEpoch), kCtxRndzv, kKeyLen)
-end rtRendezvousConfirmKey
-
--- Presence DHT id (04 4.6): 20 bytes, same PS and epoch, rp-prsnc label. Its
--- domain separation from rp-rndzv means pid and rid are independent even for the
--- same epoch. Pinned by vector 12.3.
-function rtPresenceId pPairwiseSecret, pEpoch
-   return sxKdfDerive(pPairwiseSecret, rtCanonInt(pEpoch), kCtxPrsnc, kDhtIdLen)
-end rtPresenceId
-
--- First-contact meeting id (04 4.5): derived from a PUBLIC key, so sxHash with
--- the rp-fc-meet/v1 tag, not the KDF. Publicly computable by anyone holding B's
--- identity X25519 key: the intended "knock here to reach B" location.
-function rtFirstContactMeetingId pRecipientBoxPub
-   return sxHash(pRecipientBoxPub & kTagFcMeet, kDhtIdLen)
-end rtFirstContactMeetingId
-
--- Mailbox inbox id (06, 3.4 example): sxHash(IK_x || be64(counter) || rp-mbxid).
--- Derived from a public key + a counter, so sxHash with the rp-mbxid tag. Pinned
--- by vector 12.4.
-function rtInboxId pRecipientBoxPub, pCounter
-   return sxHash(pRecipientBoxPub & rtBe64(pCounter) & kTagInboxId, kDhtIdLen)
-end rtInboxId
-
--- Safety number (02 2.5): sxHash(min(a,b) || max(a,b), 32). Identity keys sorted
--- (raw byte compare) so both parties compute the same value, order-independent.
--- Compared out of band with sxMemEqual, never `is`. Pinned by vector 12.5.
-function rtSafetyNumber pIkA, pIkB
-   local tLo, tHi
-   if rtKeyLess(pIkA, pIkB) then
-      put pIkA into tLo
-      put pIkB into tHi
-   else
-      put pIkB into tLo
-      put pIkA into tHi
-   end if
-   return sxHash(tLo & tHi, kKeyLen)
-end rtSafetyNumber
-
--- Session root key and directional keys (05 5.3.2). KM is the 32-byte sxHash of
--- the DH concatenation (compressing it to a valid KDF master); RK under rp-sess0
--- id 0; k_tx/k_rx under rp-txrx0 id 0/1. The caller applies the directional
--- orientation (smaller IK => id0 is tx) per 5.3.2.
-function rtSessionRootKey pKm
-   return sxKdfDerive(pKm, "0", kCtxSess0, kKeyLen)
-end rtSessionRootKey
-function rtSessionDirKey pRootKey, pIsTx
+function rsAnonSeed pMaster, pIndex
    local tId
-   if pIsTx then put "0" into tId
-   else put "1" into tId
-   return sxKdfDerive(pRootKey, tId, kCtxTxrx0, kKeyLen)
-end rtSessionDirKey
+   if pIndex is not an integer or pIndex < 0 then
+      rsSetError "rsAnonSeed: the persona index must be a non-negative integer"
+      return empty
+   end if
+   put kRsSubkeyAnonBase + pIndex into tId
+   return rsSubkey(pMaster, tId)
+end rsAnonSeed
 
--- Mailbox ratchet step (06, label rp-ratch): from the current 32-byte chain key
--- and the message counter, derive 64 bytes = next chain key (32) || message key
--- (32). Single-use: the caller MUST persist the advanced chain key + counter
--- before treating the message as sent/received, or a crash reuses a key (04/06,
--- section 4 of the plan). Returns an array with "next" (chain key) and "mk"
--- (message key). The 64-byte output splits deterministically, so both peers'
--- ratchets stay in lockstep.
-function rtRatchetStep pChainKey, pCounter
-   local tOut, tR
-   put sxKdfDerive(pChainKey, rtCanonInt(pCounter), kCtxRatch, 64) into tOut
-   put byte 1 to 32 of tOut into tR["next"]
-   put byte 33 to 64 of tOut into tR["mk"]
-   return tR
-end rtRatchetStep
+--------------------------------------------------------------------------
+-- identity -> handle -> onion
+--------------------------------------------------------------------------
 
--- Group per-member sender key (08, label rp-sendr): 32 bytes from the room key
--- and the member index.
-function rtSenderKey pRoomKey, pMemberIndex
-   return sxKdfDerive(pRoomKey, rtCanonInt(pMemberIndex), kCtxSendr, kKeyLen)
-end rtSenderKey
+-- The handle IS the ed25519 public key of the identity seed, as 64 lowercase
+-- hex. tests/cross-member-test.py pins sxSignKeypairFromSeed and libtorrent's
+-- btDhtKeypair to the same public point, so this equals
+-- btDhtKeypair(seedHex)["publicKey"] without the seed ever entering torrentxt.
+function rsIdentityKeys pSeed
+   local tPub, tSecret, tKeys, tErr
+   if the number of bytes in pSeed is not 32 then
+      rsSetError "rsIdentityKeys: the identity seed must be 32 bytes"
+      return empty
+   end if
+   try
+      sxSignKeypairFromSeed pSeed, tPub, tSecret
+   catch tErr
+      rsSetError "rsIdentityKeys:" && tErr
+      return empty
+   end try
+   put tPub into tKeys["publicKey"]
+   put tSecret into tKeys["secretKey"]
+   put rsBinToHexString(tPub) into tKeys["handle"]
+   if tKeys["handle"] is empty then return empty
+   return tKeys
+end rsIdentityKeys
 
--- Feed read-key rotation (07, label rp-feedk): 32 bytes from the feed master key
--- and the epoch.
-function rtFeedReadKey pFeedMasterKey, pEpoch
-   return sxKdfDerive(pFeedMasterKey, rtCanonInt(pEpoch), kCtxFeedk, kKeyLen)
-end rtFeedReadKey
+function rsHandleFromSeed pSeed
+   local tKeys
+   put rsIdentityKeys(pSeed) into tKeys
+   if tKeys is empty then return empty
+   return tKeys["handle"]
+end rsHandleFromSeed
 
--- Cover-swarm blend id (04 4.7): popularInfohash XOR sxHash(PS || rp-cover, 20).
--- The mask is a secret 20-byte value; the id rides a real popular swarm. pEpoch
--- optional: fold it in to rotate the blended id across epochs.
-function rtCoverBlendId pPopularInfohash, pPairwiseSecret, pEpoch
-   local tMaskInput, tMask, tOut, tI, tA, tB
-   if pEpoch is empty then
-      put pPairwiseSecret & kTagCover into tMaskInput
+-- SHA3-256 with two providers, preferred order fixed: sodiumxt ABI 7's
+-- sxSha3_256 (shipped 2026-08-11 precisely for this checksum; the trust root
+-- should serve its own hash), then coinxt's cxSha3_256 (the same vendored
+-- FIPS-202 code; the provider this app composed before sodiumxt shipped it).
+-- Empty when neither is installed. Both produce identical bytes, so nothing
+-- downstream cares which answered - the golden vectors pin the output, not
+-- the provider.
+private function rsSha3 pData
+   local tHash, tErr
+   try
+      put sxSha3_256(pData) into tHash
+      if the number of bytes in tHash is 32 then return tHash
+   catch tErr
+      put empty into tHash
+   end try
+   try
+      put cxSha3_256(pData) into tHash
+      if the number of bytes in tHash is 32 then return tHash
+   catch tErr
+      put empty into tHash
+   end try
+   return empty
+end rsSha3
+
+-- The OFFLINE .onion self-computation: base32(pubkey || checksum || 0x03)
+-- where checksum = SHA3-256(".onion checksum" || pubkey || 0x03)[1..2].
+-- SHA3-256 comes from sodiumxt ABI 7 (sxSha3_256) or coinxt (cxSha3_256);
+-- without either this returns empty with that story in rsLastError(). The
+-- VERIFY direction (rsVerifyOnionClaim) does not need SHA3 at all.
+function rsOnionFromPublicKey pPub
+   local tHash
+   if the number of bytes in pPub is not 32 then
+      rsSetError "rsOnionFromPublicKey: the public key must be 32 bytes"
+      return empty
+   end if
+   put rsSha3(textEncode(kRsChecksumPrefix, "UTF-8") & pPub & \
+         numToByte(3)) into tHash
+   if tHash is empty then
+      rsSetError "rsOnionFromPublicKey: the offline .onion checksum needs" && \
+            "SHA3-256 from sodiumxt ABI 7 (sxSha3_256) or coinxt" && \
+            "(cxSha3_256); install either, or read the address from" && \
+            "oxServiceAddress after publishing"
+      return empty
+   end if
+   return rsBase32Encode(pPub & (byte 1 to 2 of tHash) & numToByte(3)) & \
+         ".onion"
+end rsOnionFromPublicKey
+
+function rsOnionFromHandle pHandleHex
+   local tPub
+   put rsHexToBin(pHandleHex) into tPub
+   if the number of bytes in tPub is not 32 then
+      rsSetError "rsOnionFromHandle: the handle must be 64 hex chars"
+      return empty
+   end if
+   return rsOnionFromPublicKey(tPub)
+end rsOnionFromHandle
+
+-- Verify a CLAIMED onion address (e.g. from a followee's RSH1 head) against
+-- the handle you already trust: extract the embedded public key with
+-- onionxt's offline decoder and compare constant-time. This is the
+-- security-relevant direction - the checksum is only a typo guard - and it
+-- works today with no SHA3 and no tor daemon.
+function rsVerifyOnionClaim pOnionAddr, pHandleHex
+   local tClaimed, tExpected, tErr
+   try
+      put oxPublicKeyFromAddress(pOnionAddr) into tClaimed
+   catch tErr
+      rsSetError "rsVerifyOnionClaim: needs onionxt (oxPublicKeyFromAddress)"
+      return false
+   end try
+   if the number of bytes in tClaimed is not 32 then
+      rsSetError "rsVerifyOnionClaim: not a structurally valid onion address"
+      return false
+   end if
+   put rsHexToBin(pHandleHex) into tExpected
+   if the number of bytes in tExpected is not 32 then
+      rsSetError "rsVerifyOnionClaim: the handle must be 64 hex chars"
+      return false
+   end if
+   try
+      return sxMemEqual(tClaimed, tExpected)
+   catch tErr
+      rsSetError "rsVerifyOnionClaim:" && tErr
+      return false
+   end try
+end rsVerifyOnionClaim
+
+--------------------------------------------------------------------------
+-- rendezvous derivations (spec sections 5.1, 5.2)
+--------------------------------------------------------------------------
+
+-- The deterministic inbox swarm id: BLAKE2b-20(pubkey || "riptide-inbox"),
+-- as 40 hex - anyone who knows your handle can join the same phantom swarm.
+function rsInboxId pHandleHex
+   local tPub, tOut, tErr
+   put rsHexToBin(pHandleHex) into tPub
+   if the number of bytes in tPub is not 32 then
+      rsSetError "rsInboxId: the handle must be 64 hex chars"
+      return empty
+   end if
+   try
+      put sxHash(tPub & textEncode(kRsInboxSuffix, "ASCII"), 20) into tOut
+   catch tErr
+      rsSetError "rsInboxId:" && tErr
+      return empty
+   end try
+   return rsBinToHexString(tOut)
+end rsInboxId
+
+-- The pairwise room id: BLAKE2b-20(sortedConcat(pkA, pkB) || sessionSalt).
+-- Sorted by lowercase hex order (equals raw byte order), so both peers
+-- derive the same id no matter who computes it.
+function rsRoomId pPkAHex, pPkBHex, pSessionSalt
+   local tA, tB, tCat, tOut, tErr
+   put toLower(pPkAHex) into tA
+   put toLower(pPkBHex) into tB
+   if not rsIsHexOfLen(tA, 64) or not rsIsHexOfLen(tB, 64) then
+      rsSetError "rsRoomId: both public keys must be 64 hex chars"
+      return empty
+   end if
+   if tA <= tB then
+      put rsHexToBin(tA) & rsHexToBin(tB) into tCat
    else
-      put pPairwiseSecret & rtBe64(pEpoch) & kTagCover into tMaskInput
+      put rsHexToBin(tB) & rsHexToBin(tA) into tCat
    end if
-   put sxHash(tMaskInput, kDhtIdLen) into tMask
-   put empty into tOut
-   repeat with tI = 1 to kDhtIdLen
-      put byteToNum(byte tI of pPopularInfohash) into tA
-      put byteToNum(byte tI of tMask) into tB
-      put numToByte(tA bitXor tB) after tOut
-   end repeat
+   try
+      put sxHash(tCat & pSessionSalt, 20) into tOut
+   catch tErr
+      rsSetError "rsRoomId:" && tErr
+      return empty
+   end try
+   return rsBinToHexString(tOut)
+end rsRoomId
+
+--------------------------------------------------------------------------
+-- RSH1 - the feed head record
+--------------------------------------------------------------------------
+
+-- Build the head. Targets may be passed empty (meaning "none": the all-zeros
+-- target); the onion address may be empty (onionLen 0). Caps refuse, never
+-- truncate. Max size 260 bytes, far under the 1000-byte BEP44 value cap.
+function rsBuildHead pSeq, pDisplayName, pLatestPost, pPrekey, pOnionAddr, pProfileMeta
+   local tNameBytes, tOnion, tOnionChars, tLatest, tPrekeyT, tProfile, tOut
+   if pSeq is not an integer or pSeq < 0 then
+      rsSetError "rsBuildHead: seq must be a non-negative integer"
+      return empty
+   end if
+   -- The seq field is a u64 on the wire, but xTalk numbers are doubles, so only
+   -- values below 2^53 round-trip exactly. Refuse anything at or above that
+   -- rather than serialize a seq that re-parses to a different number (a BEP44
+   -- monotonic-counter field silently changing value is a correctness bug).
+   if pSeq >= 9007199254740992 then
+      rsSetError "rsBuildHead: seq must be below 2^53 to round-trip exactly"
+      return empty
+   end if
+   put textEncode(pDisplayName, "UTF-8") into tNameBytes
+   if the number of bytes in tNameBytes > kRsMaxDisplayName then
+      rsSetError "rsBuildHead: the display name is over" && \
+            kRsMaxDisplayName && "bytes of UTF-8"
+      return empty
+   end if
+   put rsNormalizeTarget(pLatestPost) into tLatest
+   put rsNormalizeTarget(pPrekey) into tPrekeyT
+   put rsNormalizeTarget(pProfileMeta) into tProfile
+   if tLatest is empty or tPrekeyT is empty or tProfile is empty then
+      rsSetError "rsBuildHead: a target must be empty or 40 hex chars"
+      return empty
+   end if
+   put toLower(pOnionAddr) into tOnion
+   put the number of chars in tOnion into tOnionChars
+   if tOnion is not empty and tOnionChars is not kRsOnionAddrLen then
+      rsSetError "rsBuildHead: an onion address must be" && \
+            kRsOnionAddrLen && "chars"
+      return empty
+   end if
+   put textEncode(kRsHeadMagic, "ASCII") into tOut
+   put rsBEu64(pSeq) after tOut
+   put numToByte(the number of bytes in tNameBytes) after tOut
+   put tNameBytes after tOut
+   put textEncode(tLatest, "ASCII") after tOut
+   put textEncode(tPrekeyT, "ASCII") after tOut
+   put numToByte(the number of chars in tOnion) after tOut
+   put textEncode(tOnion, "ASCII") after tOut
+   put textEncode(tProfile, "ASCII") after tOut
+   if the number of bytes in tOut > kRsMaxRecord then
+      rsSetError "rsBuildHead: the head record is over" && kRsMaxRecord && \
+            "bytes"
+      return empty
+   end if
    return tOut
-end rtCoverBlendId
+end rsBuildHead
 
--- Cover-seed recognition token id (05 5.7.2): sxHash(RS || be64(epoch) ||
--- H_cover || rp-cvrsd, 20). Per-epoch, per-torrent, computable only by a holder
--- of the recognition secret RS.
-function rtCoverRecognitionTokenId pRecogSecret, pEpoch, pCoverInfohash
-   return sxHash(pRecogSecret & rtBe64(pEpoch) & pCoverInfohash & kTagCvrsd, kDhtIdLen)
-end rtCoverRecognitionTokenId
-
--- =====================================================================
--- IDENTITY-CARD AND PREKEY-BUNDLE SERIALIZATION (02 2.3, 2.4)
--- =====================================================================
--- Built here (foundation) because more than one channel reads them and their
--- byte-exact bencode is interop-critical (the identity card is pinned by the C
--- oracle W.4). rtIdentityCard takes the three public keys and returns the
--- canonical bencode { v, ik_ed, ik_x, kx }.
-function rtIdentityCard pIkEd, pIkX, pKx
-   local tF
-   put rtBencInt(kRtProtocolVersion) into tF["v"]
-   put rtBencBytes(pIkEd) into tF["ik_ed"]
-   put rtBencBytes(pIkX) into tF["ik_x"]
-   put rtBencBytes(pKx) into tF["kx"]
-   return rtBencodeDict(tF)
-end rtIdentityCard
-
--- =====================================================================
--- DEPENDENCY / VERSION GUARD (the checkABI analogue)
--- =====================================================================
--- Riptide has no C shim, so its "ABI skew" risk is a build against a mismatched
--- SodiumXT/TorrentXT native lib. Depend on the siblings' own checkABI guards and
--- surface a clear, early error here rather than corrupting a session on first
--- use (CLAUDE.md, risk 9). Call once at startup. Returns empty on success or an
--- error string; also sets the result.
-command rtCheckDependencies
-   local tErr
-   put empty into tErr
-   -- The sibling extensions expose their ABI version; the exact query handler
-   -- name is confirmed on-engine (assumed sxAbiVersion() / btAbiVersion()).
-   if the environment is "development" then
-      -- placeholder gate: real query wired on-engine. Kept explicit so the
-      -- reconciliation point is obvious rather than silently missing.
+-- Parse a head strictly: magic, caps, and EXACT total length. Anything
+-- malformed returns empty - a truncated or padded record is refused, never
+-- partially believed.
+function rsParseHead pBytes
+   local tLen, tPos, tNameLen, tOnionLen, tHead, tField, tErr
+   put the number of bytes in pBytes into tLen
+   if tLen < 13 then
+      rsSetError "rsParseHead: truncated head record"
+      return empty
    end if
-   return tErr
-end rtCheckDependencies
+   if textDecode(byte 1 to 4 of pBytes, "ASCII") is not kRsHeadMagic then
+      rsSetError "rsParseHead: bad magic, not an RSH1 record"
+      return empty
+   end if
+   put rsReadBEu64(byte 5 to 12 of pBytes) into tHead["seq"]
+   put byteToNum(byte 13 of pBytes) into tNameLen
+   if tNameLen > kRsMaxDisplayName then
+      rsSetError "rsParseHead: display name length over cap"
+      return empty
+   end if
+   put 13 into tPos
+   if tLen < tPos + tNameLen + 40 + 40 + 1 then
+      rsSetError "rsParseHead: truncated head record"
+      return empty
+   end if
+   -- textDecode can throw on malformed UTF-8, and pBytes is attacker-supplied,
+   -- so a bad display name must be a clean refusal - not a thrown error out of a
+   -- parser the header promises never throws.
+   try
+      put textDecode(byte (tPos + 1) to (tPos + tNameLen) of pBytes, "UTF-8") \
+            into tHead["displayName"]
+   catch tErr
+      rsSetError "rsParseHead: the display name is not valid UTF-8"
+      return empty
+   end try
+   add tNameLen to tPos
+   put textDecode(byte (tPos + 1) to (tPos + 40) of pBytes, "ASCII") \
+         into tField
+   if not rsIsHexOfLen(tField, 40) then
+      rsSetError "rsParseHead: malformed latest-post target"
+      return empty
+   end if
+   put tField into tHead["latestPostTarget"]
+   add 40 to tPos
+   put textDecode(byte (tPos + 1) to (tPos + 40) of pBytes, "ASCII") \
+         into tField
+   if not rsIsHexOfLen(tField, 40) then
+      rsSetError "rsParseHead: malformed prekey target"
+      return empty
+   end if
+   put tField into tHead["prekeyTarget"]
+   add 40 to tPos
+   put byteToNum(byte (tPos + 1) of pBytes) into tOnionLen
+   add 1 to tPos
+   if tOnionLen is not 0 and tOnionLen is not kRsOnionAddrLen then
+      rsSetError "rsParseHead: bad onion address length"
+      return empty
+   end if
+   if tLen < tPos + tOnionLen + 40 then
+      rsSetError "rsParseHead: truncated head record"
+      return empty
+   end if
+   if tOnionLen is 0 then
+      put empty into tHead["onionAddr"]
+   else
+      put textDecode(byte (tPos + 1) to (tPos + tOnionLen) of pBytes, \
+            "ASCII") into tHead["onionAddr"]
+   end if
+   add tOnionLen to tPos
+   put textDecode(byte (tPos + 1) to (tPos + 40) of pBytes, "ASCII") \
+         into tField
+   if not rsIsHexOfLen(tField, 40) then
+      rsSetError "rsParseHead: malformed profile-meta target"
+      return empty
+   end if
+   put tField into tHead["profileMetaTarget"]
+   add 40 to tPos
+   if tLen is not tPos then
+      rsSetError "rsParseHead: trailing bytes after the head record"
+      return empty
+   end if
+   return tHead
+end rsParseHead
 
--- =====================================================================
--- SELF-CHECK (load-time invariants that do not need the engine)
--- =====================================================================
--- Asserts the registry invariants the constitution requires: every KDF context
--- is exactly 8 bytes (3.4). Returns "ok" or a newline list of failures. The
--- on-engine self-test (examples/riptide-tests.livecodescript) calls this plus
--- the KAT assertions.
-function rtSelfCheck
-   local tFail, tCtx
-   put empty into tFail
-   repeat for each item tCtx in (kCtxIdent & comma & kCtxRndzv & comma & kCtxPrsnc & comma & kCtxSess0 & comma & kCtxTxrx0 & comma & kCtxRatch & comma & kCtxSendr & comma & kCtxFeedk & comma & kCtxCvsig)
-      if the number of bytes of tCtx is not 8 then
-         put ("KDF context not 8 bytes: " & tCtx) & return after tFail
+--------------------------------------------------------------------------
+-- RSP1 - the post record and the tamper-evident chain
+--------------------------------------------------------------------------
+
+-- A kind-D (direct text) post, signed with the identity seed. pMediaList is
+-- a comma-separated list of 40-hex torrent info-hashes, empty for none.
+function rsBuildPost pTimestamp, pPrevTarget, pTextContent, pMediaList, pIdentitySeed
+   local tBody
+   put rsPostBody(pTimestamp, pPrevTarget, "D", pTextContent, empty, \
+         pMediaList) into tBody
+   if tBody is empty then return empty
+   return rsSignPost(tBody, pIdentitySeed)
+end rsBuildPost
+
+-- A kind-C post whose text lives in immutable chunks named in order.
+-- pChunkTargets is a comma-separated list of 1..16 40-hex targets.
+function rsBuildPostChunked pTimestamp, pPrevTarget, pChunkTargets, pMediaList, pIdentitySeed
+   local tBody
+   put rsPostBody(pTimestamp, pPrevTarget, "C", empty, pChunkTargets, \
+         pMediaList) into tBody
+   if tBody is empty then return empty
+   return rsSignPost(tBody, pIdentitySeed)
+end rsBuildPostChunked
+
+private function rsPostBody pTimestamp, pPrevTarget, pKind, pTextContent, pChunkTargets, pMediaList
+   local tPrev, tOut, tTextBytes, tChunkCount, tMediaCount, tItem, tNorm
+   if pTimestamp is an integer and pTimestamp >= 9007199254740992 then
+      rsSetError "rsPostBody: the timestamp must be below 2^53 to round-trip exactly"
+      return empty
+   end if
+   if pTimestamp is not an integer or pTimestamp < 0 then
+      rsSetError "rsPostBody: the timestamp must be a non-negative integer"
+      return empty
+   end if
+   put rsNormalizeTarget(pPrevTarget) into tPrev
+   if tPrev is empty then
+      rsSetError "rsPostBody: the previous-post target must be empty or 40 hex"
+      return empty
+   end if
+   put textEncode(kRsPostMagic, "ASCII") into tOut
+   put rsBEu64(pTimestamp) after tOut
+   put textEncode(tPrev, "ASCII") after tOut
+   put textEncode(pKind, "ASCII") after tOut
+   if pKind is "D" then
+      put textEncode(pTextContent, "UTF-8") into tTextBytes
+      if the number of bytes in tTextBytes > 65535 then
+         rsSetError "rsPostBody: the text is over the u16 length field"
+         return empty
+      end if
+      put rsBEu16(the number of bytes in tTextBytes) after tOut
+      put tTextBytes after tOut
+   else
+      set the itemDelimiter to comma
+      put the number of items in pChunkTargets into tChunkCount
+      if tChunkCount < 1 or tChunkCount > kRsMaxChunks then
+         rsSetError "rsPostBody: chunk count must be 1 to" && kRsMaxChunks
+         return empty
+      end if
+      put numToByte(tChunkCount) after tOut
+      repeat for each item tItem in pChunkTargets
+         put rsNormalizeTarget(tItem) into tNorm
+         if tNorm is kRsZeroTarget or tNorm is empty then
+            rsSetError "rsPostBody: a chunk target must be 40 non-zero hex"
+            return empty
+         end if
+         put textEncode(tNorm, "ASCII") after tOut
+      end repeat
+   end if
+   set the itemDelimiter to comma
+   if pMediaList is empty then
+      put 0 into tMediaCount
+   else
+      put the number of items in pMediaList into tMediaCount
+   end if
+   if tMediaCount > kRsMaxMedia then
+      rsSetError "rsPostBody: media count over" && kRsMaxMedia
+      return empty
+   end if
+   put numToByte(tMediaCount) after tOut
+   if tMediaCount > 0 then
+      repeat for each item tItem in pMediaList
+         put rsNormalizeTarget(tItem) into tNorm
+         if tNorm is kRsZeroTarget or tNorm is empty then
+            rsSetError "rsPostBody: a media info-hash must be 40 non-zero hex"
+            return empty
+         end if
+         put textEncode(tNorm, "ASCII") after tOut
+      end repeat
+   end if
+   if the number of bytes in tOut + 64 > kRsMaxRecord then
+      rsSetError "rsPostBody: the post record is over" && kRsMaxRecord && \
+            "bytes; move the text to chunks or drop media"
+      return empty
+   end if
+   return tOut
+end rsPostBody
+
+private function rsSignPost pBody, pIdentitySeed
+   local tKeys, tSig, tErr
+   put rsIdentityKeys(pIdentitySeed) into tKeys
+   if tKeys is empty then return empty
+   try
+      put sxSignDetached(pBody, tKeys["secretKey"]) into tSig
+   catch tErr
+      rsSetError "rsSignPost:" && tErr
+      return empty
+   end try
+   return pBody & tSig
+end rsSignPost
+
+-- Parse a post strictly (magic, caps, exact length including the 64-byte
+-- signature). Parsing does NOT verify the signature - that needs the
+-- author's public key, which the caller trusts from elsewhere; call
+-- rsVerifyPost for that.
+function rsParsePost pBytes
+   local tLen, tPos, tKind, tCount, tPost, tField, tI, tTextLen, tList, tErr
+   put the number of bytes in pBytes into tLen
+   if tLen < 4 + 8 + 40 + 1 + 1 + 64 then
+      rsSetError "rsParsePost: truncated post record"
+      return empty
+   end if
+   if textDecode(byte 1 to 4 of pBytes, "ASCII") is not kRsPostMagic then
+      rsSetError "rsParsePost: bad magic, not an RSP1 record"
+      return empty
+   end if
+   put rsReadBEu64(byte 5 to 12 of pBytes) into tPost["timestamp"]
+   put textDecode(byte 13 to 52 of pBytes, "ASCII") into tField
+   if not rsIsHexOfLen(tField, 40) then
+      rsSetError "rsParsePost: malformed previous-post target"
+      return empty
+   end if
+   put tField into tPost["prevPostTarget"]
+   put textDecode(byte 53 of pBytes, "ASCII") into tKind
+   put tKind into tPost["kind"]
+   put 53 into tPos
+   if tKind is "D" then
+      if tLen < tPos + 2 + 1 + 64 then
+         rsSetError "rsParsePost: truncated post record"
+         return empty
+      end if
+      put rsReadBEu16(byte (tPos + 1) to (tPos + 2) of pBytes) into tTextLen
+      add 2 to tPos
+      if tLen < tPos + tTextLen + 1 + 64 then
+         rsSetError "rsParsePost: text length runs past the record"
+         return empty
+      end if
+      -- Attacker-supplied bytes; malformed UTF-8 is a clean refusal, not a throw
+      -- (the header promises this parser never throws).
+      try
+         put textDecode(byte (tPos + 1) to (tPos + tTextLen) of pBytes, \
+               "UTF-8") into tPost["text"]
+      catch tErr
+         rsSetError "rsParsePost: the post text is not valid UTF-8"
+         return empty
+      end try
+      add tTextLen to tPos
+   else if tKind is "C" then
+      put byteToNum(byte (tPos + 1) of pBytes) into tCount
+      add 1 to tPos
+      if tCount < 1 or tCount > kRsMaxChunks then
+         rsSetError "rsParsePost: chunk count out of range"
+         return empty
+      end if
+      if tLen < tPos + tCount * 40 + 1 + 64 then
+         rsSetError "rsParsePost: truncated chunk list"
+         return empty
+      end if
+      put empty into tList
+      repeat with tI = 1 to tCount
+         put textDecode(byte (tPos + 1) to (tPos + 40) of pBytes, "ASCII") \
+               into tField
+         if not rsIsHexOfLen(tField, 40) then
+            rsSetError "rsParsePost: malformed chunk target"
+            return empty
+         end if
+         if tList is empty then
+            put tField into tList
+         else
+            put comma & tField after tList
+         end if
+         add 40 to tPos
+      end repeat
+      put tList into tPost["chunkTargets"]
+   else
+      rsSetError "rsParsePost: unknown post kind"
+      return empty
+   end if
+   put byteToNum(byte (tPos + 1) of pBytes) into tCount
+   add 1 to tPos
+   if tCount > kRsMaxMedia then
+      rsSetError "rsParsePost: media count out of range"
+      return empty
+   end if
+   if tLen is not tPos + tCount * 40 + 64 then
+      rsSetError "rsParsePost: record length does not match its fields"
+      return empty
+   end if
+   put empty into tList
+   repeat with tI = 1 to tCount
+      put textDecode(byte (tPos + 1) to (tPos + 40) of pBytes, "ASCII") \
+            into tField
+      if not rsIsHexOfLen(tField, 40) then
+         rsSetError "rsParsePost: malformed media info-hash"
+         return empty
+      end if
+      if tList is empty then
+         put tField into tList
+      else
+         put comma & tField after tList
+      end if
+      add 40 to tPos
+   end repeat
+   put tList into tPost["mediaTargets"]
+   return tPost
+end rsParsePost
+
+-- Verify a post's author signature: parse first (so a malformed buffer is
+-- refused before any crypto), then check the trailing 64 bytes are a valid
+-- ed25519 detached signature by the handle over everything before them.
+function rsVerifyPost pBytes, pHandleHex
+   local tPub, tParsed, tLen, tErr
+   put rsParsePost(pBytes) into tParsed
+   if tParsed is empty then return false
+   put rsHexToBin(pHandleHex) into tPub
+   if the number of bytes in tPub is not 32 then
+      rsSetError "rsVerifyPost: the handle must be 64 hex chars"
+      return false
+   end if
+   put the number of bytes in pBytes into tLen
+   try
+      return sxSignVerifyDetached(byte (tLen - 63) to tLen of pBytes, \
+            byte 1 to (tLen - 64) of pBytes, tPub)
+   catch tErr
+      rsSetError "rsVerifyPost:" && tErr
+      return false
+   end try
+end rsVerifyPost
+
+--------------------------------------------------------------------------
+-- BEP44 helpers
+--------------------------------------------------------------------------
+
+-- bencode of a byte string: <len>:<bytes>. The only bencode shape riptide
+-- ever puts on the DHT (the v for btDhtBep44SignBuf / btDhtPutSigned and
+-- the input whose SHA-1 is an immutable item's target).
+function rsBencodeBytes pData
+   local tLen
+   put the number of bytes in pData into tLen
+   return textEncode(tLen & ":", "ASCII") & pData
+end rsBencodeBytes
+
+--------------------------------------------------------------------------
+-- private: hex, big-endian integers, base32
+--------------------------------------------------------------------------
+
+-- Strict LOWERCASE hex of an exact length. The check is by BYTE VALUE, not
+-- `is in`: `is in` honours the caseSensitive (default FALSE), so "A" is in
+-- "abcdef" would be true and an uppercase target would parse as valid - a
+-- non-canonical record accepted (the malleability the strict parse exists to
+-- refuse; the coinxt discipline-3 lesson). Digits 0-9 are bytes 48..57, lower
+-- a-f are bytes 97..102; nothing else passes, whatever the caller set.
+private function rsIsHexOfLen pValue, pLen
+   local tI, tN
+   if the number of chars in pValue is not pLen then return false
+   repeat with tI = 1 to pLen
+      put byteToNum(byte tI of pValue) into tN
+      if not ((tN >= 48 and tN <= 57) or (tN >= 97 and tN <= 102)) then
+         return false
       end if
    end repeat
-   if tFail is empty then return "ok"
-   return tFail
-end rtSelfCheck
+   return true
+end rsIsHexOfLen
 
--- =====================================================================
--- sx BRIDGE (assumed SodiumXT script API; reconcile here on-engine)
--- =====================================================================
--- Every sx* call in this library goes through the wrappers below so the one
--- place to fix a signature mismatch is here. They are intentionally 1:1 pass-
--- throughs to the SodiumXT public handlers; if SodiumXT exposes a different
--- shape (for example a keypair as "pub\nsec" rather than an array), adapt it
--- HERE. Left as direct calls because the assumed shapes (documented at the top)
--- match the doc-11 handler table; each is a single edit if reality differs.
---
--- (No wrapper bodies are needed while the assumed names match: the channel
--- modules and this file call sxKdfDerive/sxHash/... directly. This block is the
--- documented contract and the reconciliation checklist, not dead code.)
+-- Empty -> the all-zeros "none" target; otherwise require 40 hex chars.
+-- Returns empty on anything else (callers refuse the whole record).
+private function rsNormalizeTarget pTarget
+   local tT
+   if pTarget is empty then return kRsZeroTarget
+   put toLower(pTarget) into tT
+   if not rsIsHexOfLen(tT, 40) then return empty
+   return tT
+end rsNormalizeTarget
+
+private function rsHexToBin pHex
+   local tOut, tErr
+   try
+      put sxHex2Bin(textEncode(toLower(pHex), "ASCII")) into tOut
+   catch tErr
+      rsSetError "rsHexToBin: malformed hex"
+      return empty
+   end try
+   return tOut
+end rsHexToBin
+
+private function rsBinToHexString pData
+   local tOut, tErr
+   try
+      put textDecode(sxBin2Hex(pData), "ASCII") into tOut
+   catch tErr
+      rsSetError "rsBinToHexString:" && tErr
+      return empty
+   end try
+   return tOut
+end rsBinToHexString
+
+private function rsBEu16 pNum
+   return binaryEncode("n", pNum)
+end rsBEu16
+
+private function rsBEu64 pNum
+   return binaryEncode("NN", pNum div 4294967296, pNum mod 4294967296)
+end rsBEu64
+
+private function rsReadBEu16 pBytes
+   return byteToNum(byte 1 of pBytes) * 256 + byteToNum(byte 2 of pBytes)
+end rsReadBEu16
+
+private function rsReadBEu32 pBytes
+   local tA, tB, tC, tD
+   put byteToNum(byte 1 of pBytes) into tA
+   put byteToNum(byte 2 of pBytes) into tB
+   put byteToNum(byte 3 of pBytes) into tC
+   put byteToNum(byte 4 of pBytes) into tD
+   return ((tA * 256 + tB) * 256 + tC) * 256 + tD
+end rsReadBEu32
+
+private function rsReadBEu64 pBytes
+   return rsReadBEu32(byte 1 to 4 of pBytes) * 4294967296 + \
+         rsReadBEu32(byte 5 to 8 of pBytes)
+end rsReadBEu64
+
+-- Base32, RFC 4648 lowercase, no padding - the onionxt algorithm with the
+-- same integer discipline (no caret, no bare div/mod on wide accumulators;
+-- the accumulator is masked to its pending bits every step so it never
+-- outgrows exact double precision).
+private function rsPow2 pN
+   local tOut, tI
+   put 1 into tOut
+   repeat pN times
+      put tOut * 2 into tOut
+   end repeat
+   return tOut
+end rsPow2
+
+private function rsIntDiv pA, pB
+   return trunc(pA / pB)
+end rsIntDiv
+
+private function rsIntMod pA, pB
+   return pA - pB * trunc(pA / pB)
+end rsIntMod
+
+private function rsBase32Encode pData
+   local tAcc, tBits, tOut, tI, tIndex
+   put 0 into tAcc
+   put 0 into tBits
+   put empty into tOut
+   repeat with tI = 1 to the number of bytes in pData
+      put tAcc * 256 + byteToNum(byte tI of pData) into tAcc
+      add 8 to tBits
+      repeat while tBits >= 5
+         subtract 5 from tBits
+         put rsIntMod(rsIntDiv(tAcc, rsPow2(tBits)), 32) into tIndex
+         put char (tIndex + 1) of kRsBase32Alphabet after tOut
+         put rsIntMod(tAcc, rsPow2(tBits)) into tAcc
+      end repeat
+   end repeat
+   if tBits > 0 then
+      put rsIntMod(tAcc * rsPow2(5 - tBits), 32) into tIndex
+      put char (tIndex + 1) of kRsBase32Alphabet after tOut
+   end if
+   return tOut
+end rsBase32Encode
